@@ -1,0 +1,25 @@
+ROOF BUILDER
+
+1.1.0
+NEW:
+- Added Round Ends for Gap Free in Two Slopes mode
+- Added Ridge Caps (Hip, Gap Free with Two Slopes): caps made from the roof texture, with mitred joints. None on valleys or curved outlines
+- Added Seams menu (replaces Softer Seams): None / Line / Soft / Ridge Caps. Ridge Caps settings: Style, Width, Brightness, Outline
+- Added Repeat Point: moves where the texture repeats
+- Added Pitch on Gap Free roofs
+- Added Merge With Roof Below button in the Pattern Tool
+
+CHANGED:
+- Added various settings buttons (cog icons): Ridge Caps (next to Seams), Texture Settings, Merge (Merge Height, junction line, valley shadow).
+- Improved merged roofs: thinner junction line, valley shadow on both roofs.
+- Added more Merge Height: -1000 to +1000 px.
+- Pattern Tool settings reset when a map is opened.
+
+FIXED:
+- Fixed Side lines too thick on textures without tile rows (hay, thatch...)
+- Fixed Roof Builder section missing with Minor Utils
+- Fixed Pattern Tool settings not resetting when a map is opened
+
+
+1.0.0
+- Official release.

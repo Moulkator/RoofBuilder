@@ -45,13 +45,18 @@ const MODE_OFF = 0
 const MODE_FILL = 1
 const MODE_CENTER = 2
 const MODE_HIP = 3
+# Seams (ridge / hip lines): none, ink line + shadow, soft blend, ridge caps.
+const SEAMS_NONE = 0
+const SEAMS_LINE = 1
+const SEAMS_SOFT = 2
+const SEAMS_CAPS = 3
 const LUT_N = 512
 const MAX_MERGE = 8
 const SMOOTH_MIN_POINTS = 16
 const MAX_EDGES = 1024
+const CAP_SIM = 0.766        # Ridge Caps: faces turned by less (~40°) are one curved surface
+const MAX_CAP_ENDS = 32
 const ANALYSIS_COLUMNS = 128
-const CONFIG_DIR = "user://BetterRoofPatterns"
-const CONFIG_PATH = "user://BetterRoofPatterns/tool_settings.cfg"
 const UI_TOOL_NAME = "BetterRoofPatternsToolSection"
 const UI_SELECT_NAME = "BetterRoofPatternsSelectSection"
 const HEADER_ICON_PX = 24
@@ -78,7 +83,18 @@ const DEFAULT_CFG = {
 	"apex_lock": false,
 	"merge": false,
 	"merge_height": 0.0,
+	"valley_line": 100.0,
+	"valley_opacity": 35.0,
+	"valley_width": 100.0,
 	"side_ink": true,
+	"ridge_caps": false,
+	"cap_width": 100.0,
+	"cap_style": 0,
+	"cap_outline": 1,
+	"cap_bright": 0.0,
+	"seams": SEAMS_SOFT,
+	"repeat": 0.0,
+	"round_ends": 0,
 }
 
 # Colour and Modify Things: the settings of its material that matter for a
@@ -149,6 +165,34 @@ uniform float perimeter = 1000.0;
 uniform float v_max = 0.0;
 uniform float v_min = 0.0;
 uniform bool mirror = false;
+// Ridge Caps: a row of cap tiles, made from the roof texture turned along the
+// ridge / hip lines (one tile column wide, times cap_scale).
+uniform bool ridge_caps = false;
+uniform float cap_scale = 1.0;
+// 1 = tiles (one tile column turned along the line, for half-round tiles),
+// 2 = band (one course of the texture laid along the line).
+uniform int cap_style = 2;
+// Cap width base (texels): ridges get 1.15 of it, hips 0.8.
+uniform float cap_base = 64.0;
+// Hip roofs: lines ending at the centre of a curved part of the outline
+// (edges rows 4-5, see _cap_ends).
+uniform int cap_ends = 0;
+// Ridge Caps outline: 0 none, 1 ink line, 2 blurred (fades out at its edges).
+uniform int cap_outline = 1;
+// Cap Brightness: gamma applied to the cap texture (< 1 brighter).
+uniform float cap_gamma = 1.0;
+// Seams set to None: no ink line / shadow on hard ridge and hip lines.
+uniform bool seam_lines = true;
+// Size of the ink lines and seam shadows (texels): the tile row height, or a
+// fixed share of the texture when no rows were found (thatch, hay...).
+uniform float ink_h = 64.0;
+// Round Ends (Two Slopes): the ends of the ridge become half cones, centred
+// at round_x0 / round_x1 (texels along the ridge).
+uniform bool round_start = false;
+uniform bool round_end = false;
+uniform float round_x0 = 0.0;
+uniform float round_x1 = 0.0;
+uniform float round_a = 1.0;
 uniform float ridge_offset = 0.0;
 uniform float u_offset = 0.0;
 uniform bool side_ink = true;
@@ -171,7 +215,13 @@ uniform bool merge_on = false;
 uniform sampler2D merge_data;
 uniform int merge_count = 0;
 uniform int merge_lut_n = 512;
-uniform float merge_shadow = 0.55;
+// Valley shadow where two merged roofs meet: same strength and fade on both
+// roofs.
+uniform float valley_strength = 0.35;
+// Width of the ink line on the junction (1 = default, 0 = none).
+uniform float junction_ink = 1.0;
+// Width of the valley shadow where two merged roofs meet (both sides).
+uniform float valley_w = 40.0;
 // Merge Height: raises (+) or lowers (-) this roof against the roofs below.
 uniform float merge_raise = 0.0;
 // Contact shadow: the part of this roof that is really drawn is blurred into
@@ -287,6 +337,32 @@ float course_tiles(float kf, float t0, float d_ref, float tiles_eave)
 	return max(n, 1.0);
 }
 
+// Round Ends: distance from the eave (texels, before Pitch) of a point b of
+// texture space (rotated, in texels) in a round end of a Two Slopes roof
+// whose eaves are at v_hi / v_lo (texels), ra: length of the round end along
+// the ridge; -1 outside the round end, -2 when
+// b is not in a round end.
+float round_end_t(vec2 b, float v_hi, float v_lo, bool rs, bool re, float x0, float x1, float ra)
+{
+	float xc = 0.0;
+	if (rs && b.x < x0)
+	{
+		xc = x0;
+	}
+	else if (re && b.x > x1)
+	{
+		xc = x1;
+	}
+	else
+	{
+		return -2.0;
+	}
+	float rr = (v_hi - v_lo) * 0.5;
+	// Half an ellipse: ra along the ridge (shorter than rr on short roofs).
+	float rho = length(vec2((b.x - xc) / max(ra, 0.001), (b.y - (v_hi + v_lo) * 0.5) / max(rr, 0.001)));
+	return rho > 1.0 ? -1.0 : (1.0 - rho) * rr;
+}
+
 // Height of merged roof pi at v, from its visible eave, in the same units as
 // t (distance from the eave); -1 outside it.
 float merge_height(vec2 v, int pi)
@@ -358,7 +434,22 @@ float merge_height(vec2 v, int pi)
 		if (p0.z > 0.5)
 		{
 			hm = min(hm, (base.y - p4.w) * p4.y);
+			vec4 p5 = texelFetch(merge_data, ivec2(5, r0), 0);
+			if (p5.x > 0.5)
+			{
+				int fl5 = int(p5.x + 0.5);
+				float rt = round_end_t(base * p4.xy, p4.z * p4.y, p4.w * p4.y, fl5 == 1 || fl5 == 3, fl5 >= 2, p5.y, p5.z, p5.w);
+				if (rt > -1.5)
+				{
+					if (rt < 0.0)
+					{
+						return -1.0;
+					}
+					hm = rt;
+				}
+			}
 		}
+		hm *= p3.y;
 	}
 	else if (mode == 3)
 	{
@@ -499,12 +590,20 @@ float own_height(vec2 p)
 	}
 	vec2 size = vec2(textureSize(albedo, 0));
 	vec2 base = rotate_uv(p / size, rotation);
+	if (mirror)
+	{
+		float rt = round_end_t(base * size, v_max * size.y, v_min * size.y, round_start, round_end, round_x0, round_x1, round_a);
+		if (rt > -1.5)
+		{
+			return rt < 0.0 ? -1.0 : rt * pitch_scale;
+		}
+	}
 	float t = (v_max - base.y) * size.y;
 	if (mirror)
 	{
 		t = min(t, (base.y - v_min) * size.y);
 	}
-	return t;
+	return t * pitch_scale;
 }
 
 // Is this roof really drawn at p? (inside the shape, above its visible eave,
@@ -546,6 +645,14 @@ float bake_coverage(vec2 v)
 
 // Skirt: soft shadow on the roof below, all around the drawn part of this
 // roof (junction lines, sides without an eave, corners), from the bake.
+// Valley shadow profile: x = 1 on the line where the roofs meet, 0 at its
+// width; smooth at both ends.
+float valley_fade(float x)
+{
+	x = clamp(x, 0.0, 1.0);
+	return x * x * (3.0 - 2.0 * x);
+}
+
 vec4 skirt_shadow(vec2 v)
 {
 	float c = textureLod(bake_tex, (v - bake_pos) / bake_size, 0.0).r;
@@ -558,15 +665,53 @@ vec4 skirt_shadow(vec2 v)
 	{
 		return vec4(0.0);
 	}
-	float s = clamp(c * 2.0, 0.0, 1.0);
+	// c = share of a disc of radius skirt_w covered by the roof above: back
+	// to the distance from its edge, so this side fades exactly like the
+	// other one (valley_fade).
+	float x = 1.0;
+	if (c < 0.5)
+	{
+		float lo = 0.0;
+		float hi = 1.0;
+		for (int i = 0; i < 10; i++)
+		{
+			float u = (lo + hi) * 0.5;
+			float f = (acos(u) - u * sqrt(1.0 - u * u)) / 3.14159265;
+			if (f > c)
+			{
+				lo = u;
+			}
+			else
+			{
+				hi = u;
+			}
+		}
+		x = 1.0 - (lo + hi) * 0.5;
+	}
 	// Nothing deep under the drawn part itself (it would show through
 	// translucent textures).
-	return vec4(0.0, 0.0, 0.0, merge_shadow * pow(s, 1.5) * (1.0 - smoothstep(0.8, 0.97, c)));
+	return vec4(0.0, 0.0, 0.0, valley_strength * valley_fade(x) * (1.0 - smoothstep(0.8, 0.97, c)));
 }
 
 float course_rand(float k)
 {
 	return fract(sin(k * 12.9898 + 4.1414) * 43758.5453);
+}
+
+// Round Ends: arc length on the ellipse (ra along the ridge, rr across) from
+// its near-slope end to angle phi (Simpson, 8 steps).
+float round_arc(float phi, float ra, float rr)
+{
+	float h = phi / 8.0;
+	float acc = 0.0;
+	for (int i = 0; i <= 8; i++)
+	{
+		float th = h * float(i);
+		float f = sqrt(ra * ra * cos(th) * cos(th) + rr * rr * sin(th) * sin(th));
+		float wgt = (i == 0 || i == 8) ? 1.0 : (i % 2 == 1 ? 4.0 : 2.0);
+		acc += wgt * f;
+	}
+	return acc * h / 3.0;
 }
 
 // ── Colour and Modify Things (same steps as its universal shader) ──
@@ -785,6 +930,364 @@ vec4 ct_edge_blur(vec4 color, vec2 v)
 	return color;
 }
 
+// Ridge Caps: one cap piece. a: along the cap (texels, from where its tiles
+// start), sx: across the cap (-1..1 on its sides), et:
+// past its end (0..1 on the rounded end, along end_dir), hw: half width.
+// Adds the cap's small shadow on the roof beside it to shadow.
+vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw, vec4 tint, vec2 size, float cpx, inout float shadow)
+{
+	float r = length(vec2(sx, max(et, 0.0)));
+	if (r > 1.0)
+	{
+		// Small shadow beside the cap (none when it fades out: Blurred).
+		if (cap_outline != 2)
+		{
+			shadow = max(shadow, 1.0 - clamp((r - 1.0) / 0.6, 0.0, 1.0));
+		}
+		return vec4(0.0);
+	}
+	vec2 cuv;
+	float k_len;
+	if (cap_style == 1)
+	{
+		// One tile column turned along the line, fitted to the width.
+		float col_w = tile_n > 0.0 ? size.x / tile_n : max(row_h, 1.0);
+		k_len = 2.0 * hw / col_w;
+		cuv = vec2((0.5 + 0.5 * sx) * col_w / size.x, band_start + mod(a / k_len, band));
+	}
+	else
+	{
+		// One course of the texture laid along the line.
+		float rh = min(max(row_h, 1.0), band);
+		k_len = 2.0 * hw / rh;
+		float cy = row_y0 + (0.5 - 0.5 * sx) * rh;
+		cuv = vec2(a / k_len / size.x, band_start + mod(cy - band_start, band));
+	}
+	vec4 cap = textureLod(albedo, vec2(cuv.x, cuv.y / size.y), max(log2(cpx / k_len), 0.0));
+	vec3 cc = ct_on ? ct_colour(cap).rgb : cap.rgb * tint.rgb;
+	cc = pow(max(cc, vec3(0.0)), vec3(cap_gamma));
+	// Rounded: darker toward its sides and end, lit across.
+	cc *= 1.0 - 0.3 * r * r;
+	if (shade > 0.0)
+	{
+		cc *= max(1.0 + shade * 0.6 * dot(across * sx + end_dir * max(et, 0.0), light_dir), 0.0);
+	}
+	float c_ink = max(ink_h * 0.03, cpx * 1.2);
+	if (cap_outline == 1)
+	{
+		cc *= mix(1.0, 0.15, 1.0 - smoothstep(c_ink * 0.5, c_ink, (1.0 - r) * hw));
+	}
+	float ck = clamp((1.0 - r) * hw / cpx + 0.5, 0.0, 1.0) * smoothstep(0.3, 0.7, cap.a);
+	if (cap_outline == 2)
+	{
+		// Blurred: the cap fades out toward its sides and ends.
+		ck *= smoothstep(0.0, 0.55, 1.0 - r);
+	}
+	return vec4(cc, ck);
+}
+
+// Distance from v to face i as the Hip mode measures it: past an inner
+// corner the face's plane runs on (on the far side of the valley only).
+float hip_face_d(vec2 v, int i)
+{
+	vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+	vec4 fl = texelFetch(edges, ivec2(i, 1), 0);
+	vec4 nb = texelFetch(edges, ivec2(i, 2), 0);
+	vec2 ab = e.zw - e.xy;
+	float h = dot(v - e.xy, ab) / max(dot(ab, ab), 0.000001);
+	bool inner = dot(v - e.xy, fl.xy) <= 0.0;
+	bool ext = (h >= 0.0 && h <= 1.0)
+		|| (inner && h < 0.0 && fl.z > 0.5 && dot(v - e.xy, nb.xy + normalize(ab)) > 0.0)
+		|| (inner && h > 1.0 && fl.w > 0.5 && dot(v - e.zw, normalize(ab) + nb.zw) < 0.0);
+	if (!ext && ((h < 0.0 && fl.z > 0.5) || (h > 1.0 && fl.w > 0.5)))
+	{
+		// Around an inner corner the distance to the corner point is not a
+		// roof face (round swirl, and a false seam next to the valley).
+		return 100000000.0;
+	}
+	return ext ? abs(dot(v - e.xy, fl.xy)) : length(v - e.xy - ab * clamp(h, 0.0, 1.0));
+}
+
+// Ridge Caps: the face whose outline a ridge's tiles follow (a curved one if
+// any, so that they run on unbroken around curves).
+int cap_ref(int i, int j)
+{
+	bool ci = texelFetch(edges, ivec2(i, 3), 0).y > 0.5;
+	bool cj = texelFetch(edges, ivec2(j, 3), 0).y > 0.5;
+	if (ci != cj)
+	{
+		return ci ? i : j;
+	}
+	return i < j ? i : j;
+}
+
+// hip_face_d, but around a sharp inner corner the plane also runs on on the
+// near side of the valley (virt: only there): finds the lines meeting at the
+// top of a valley (cap_end cuts them where they really end). Not around the
+// small inner corners of a curved outline (planes there come too close).
+float cap_face_d(vec2 v, int i, out bool virt)
+{
+	vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+	vec4 fl = texelFetch(edges, ivec2(i, 1), 0);
+	vec4 nb = texelFetch(edges, ivec2(i, 2), 0);
+	vec2 ab = e.zw - e.xy;
+	vec2 dn = normalize(ab);
+	float h = dot(v - e.xy, ab) / max(dot(ab, ab), 0.000001);
+	bool inner = dot(v - e.xy, fl.xy) <= 0.0;
+	bool side_a = dot(v - e.xy, nb.xy + dn) > 0.0;
+	bool side_b = dot(v - e.zw, dn + nb.zw) < 0.0;
+	bool ext = (h >= 0.0 && h <= 1.0)
+		|| (inner && h < 0.0 && fl.z > 0.5 && (dot(nb.xy, dn) <= 0.766 || side_a))
+		|| (inner && h > 1.0 && fl.w > 0.5 && (dot(dn, nb.zw) <= 0.766 || side_b));
+	virt = ext && ((h < 0.0 && !side_a) || (h > 1.0 && !side_b));
+	if (!ext && ((h < 0.0 && fl.z > 0.5) || (h > 1.0 && fl.w > 0.5)))
+	{
+		return 100000000.0;
+	}
+	return ext ? abs(dot(v - e.xy, fl.xy)) : length(v - e.xy - ab * clamp(h, 0.0, 1.0));
+}
+
+// Ridge Caps: does face i's plane hold at q (not only a plane running on
+// past a sharp inner corner, see cap_face_d)?
+bool cap_holds(vec2 q, int i)
+{
+	vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+	vec4 fl = texelFetch(edges, ivec2(i, 1), 0);
+	vec4 nb = texelFetch(edges, ivec2(i, 2), 0);
+	vec2 ab = e.zw - e.xy;
+	vec2 dn = normalize(ab);
+	float h = dot(q - e.xy, ab) / max(dot(ab, ab), 0.000001);
+	bool inner = dot(q - e.xy, fl.xy) <= 0.0;
+	if (h < 0.0 && fl.z > 0.5 && dot(nb.xy, dn) <= 0.766 && !(inner && dot(q - e.xy, nb.xy + dn) > 0.0))
+	{
+		return false;
+	}
+	if (h > 1.0 && fl.w > 0.5 && dot(dn, nb.zw) <= 0.766 && !(inner && dot(q - e.zw, dn + nb.zw) < 0.0))
+	{
+		return false;
+	}
+	return true;
+}
+
+// Ridge Caps: is p on the line between faces a and b, with face c farther?
+bool cap_runs(vec2 p, int a, int b, int c)
+{
+	float da = hip_face_d(p, a);
+	return da < 10000000.0 && hip_face_d(p, b) < 10000000.0 && hip_face_d(p, c) > da;
+}
+
+// Ridge Caps: does the line between faces a and b end where face c comes in
+// (the three planes meet at x)? dir: the way past that end. The caps meeting
+// there end rounded and overlap (lowest r kept): a mitre where the face
+// between them is narrow, a rounded corner around a valley's top.
+bool cap_end(int a, int b, int c, out vec2 x, out vec2 dir)
+{
+	x = vec2(0.0);
+	dir = vec2(0.0);
+	if (c < 0)
+	{
+		return false;
+	}
+	vec4 ea = texelFetch(edges, ivec2(a, 0), 0);
+	vec2 na = texelFetch(edges, ivec2(a, 1), 0).xy;
+	vec4 eb = texelFetch(edges, ivec2(b, 0), 0);
+	vec2 nb = texelFetch(edges, ivec2(b, 1), 0).xy;
+	vec4 ec = texelFetch(edges, ivec2(c, 0), 0);
+	vec2 nc = texelFetch(edges, ivec2(c, 1), 0).xy;
+	vec2 r1 = na - nb;
+	vec2 r2 = na - nc;
+	float det = r1.x * r2.y - r1.y * r2.x;
+	if (abs(det) < 0.000001)
+	{
+		return false;
+	}
+	float ha = dot(ea.xy, na);
+	float c1 = ha - dot(eb.xy, nb);
+	float c2 = ha - dot(ec.xy, nc);
+	x = vec2(c1 * r2.y - c2 * r1.y, r1.x * c2 - r2.x * c1) / det;
+	vec2 cd = normalize(vec2(-r1.y, r1.x));
+	float pr = max(cap_base * cap_scale * 0.5, 1.0);
+	bool s1 = cap_runs(x + cd * pr, a, b, c);
+	bool s2 = cap_runs(x - cd * pr, a, b, c);
+	if (s1 == s2)
+	{
+		return false;
+	}
+	dir = s1 ? -cd : cd;
+	return true;
+}
+
+// Ridge Caps on Hip roofs: the cap on the line where faces i and j meet
+// (none on valleys). end_on: it ends at end_p, rounded, toward end_dir.
+// r: 0 on the line, 1 on the cap's sides; where caps meet, the one with the
+// lowest r is kept (mitred joints).
+vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec4 tint, vec2 size, float cpx, inout float shadow, out float r)
+{
+	r = 100.0;
+	if (i < 0 || j < 0 || i == j)
+	{
+		return vec4(0.0);
+	}
+	vec4 ei = texelFetch(edges, ivec2(i, 0), 0);
+	vec4 fi = texelFetch(edges, ivec2(i, 1), 0);
+	vec4 ej = texelFetch(edges, ivec2(j, 0), 0);
+	vec4 fj = texelFetch(edges, ivec2(j, 1), 0);
+	if ((j == (i + 1) % edge_count && fi.w > 0.5) || (i == (j + 1) % edge_count && fj.w > 0.5))
+	{
+		return vec4(0.0);
+	}
+	vec2 g = fi.xy - fj.xy;
+	float l2 = dot(g, g);
+	if (l2 < 0.000001)
+	{
+		return vec4(0.0);
+	}
+	float cosn = dot(fi.xy, fj.xy);
+	float hw = cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * cap_scale * 0.5;
+	float dd = dot(ej.xy - v, fj.xy) - dot(ei.xy - v, fi.xy);
+	float s = dd / sqrt(l2);
+	if (abs(s) > hw * 1.7)
+	{
+		return vec4(0.0);
+	}
+	// Point of the line, and one orientation whichever face looks at it.
+	vec2 q = v - dd * g / l2;
+	if (!end_on && (!cap_holds(q, i) || !cap_holds(q, j)))
+	{
+		// Not a line of this roof there (a plane running on past an inner
+		// corner, see cap_face_d).
+		return vec4(0.0);
+	}
+	float o = i < j ? 1.0 : -1.0;
+	vec2 across = normalize(g) * o;
+	float a;
+	if (cosn < -0.7)
+	{
+		// Ridge: measured along the outline of one face (curved outlines
+		// included, see _cap_runs), so the tiles run on unbroken.
+		int rf = cap_ref(i, j);
+		vec4 er = rf == i ? ei : ej;
+		vec2 nr = rf == i ? fi.xy : fj.xy;
+		vec4 sr = texelFetch(edges, ivec2(rf, 3), 0);
+		a = sr.z + dot(q - er.xy, normalize(er.zw - er.xy)) - dot(er.xy - q, nr) * sr.w;
+	}
+	else
+	{
+		// Hip: laid from the eave corner up (its height over how fast it
+		// rises), so two hips meeting at the top match.
+		a = dot(ei.xy - q, fi.xy) / max(abs(dot(vec2(-across.y, across.x), fi.xy)), 0.2);
+	}
+	float et = end_on ? dot(q - end_p, end_dir) / hw : 0.0;
+	float sx = o * s / hw;
+	r = length(vec2(sx, max(et, 0.0)));
+	return cap_piece(a, sx, et, across, end_dir, hw, tint, size, cpx, shadow);
+}
+
+// Ridge Caps: is the line between faces a and b (b at distance db) only the
+// meeting of two faces of a curved outline? Then the faces between them,
+// turning from a toward b, are nearer: no such line (cone of a round end or
+// of a rounded corner).
+bool cap_bridged(vec2 v, int a, int b, float db)
+{
+	vec2 na = texelFetch(edges, ivec2(a, 1), 0).xy;
+	vec2 nb = texelFetch(edges, ivec2(b, 1), 0).xy;
+	if (dot(na, nb) < -0.94)
+	{
+		return false;
+	}
+	int fn = (a + 1) % edge_count;
+	int fp = (a - 1 + edge_count) % edge_count;
+	int st = dot(texelFetch(edges, ivec2(fn, 1), 0).xy, nb) >= dot(texelFetch(edges, ivec2(fp, 1), 0).xy, nb) ? 1 : -1;
+	int f = a;
+	vec2 nf = na;
+	bool found = false;
+	bool done = false;
+	for (int k = 0; k < 3; k++)
+	{
+		if (!done)
+		{
+			int f2 = (f + st + edge_count) % edge_count;
+			vec2 n2 = texelFetch(edges, ivec2(f2, 1), 0).xy;
+			if (f2 == b || dot(n2, nf) <= 0.766)
+			{
+				done = true;
+			}
+			else if (dot(n2, nb) > 0.766 && hip_face_d(v, f2) < db)
+			{
+				found = true;
+				done = true;
+			}
+			f = f2;
+			nf = n2;
+		}
+	}
+	return found;
+}
+
+// Ridge Caps: face i in the range of faces f0..f1 (around the outline)?
+bool cap_in(int i, int f0, int f1)
+{
+	return f0 <= f1 ? (i >= f0 && i <= f1) : (i >= f0 || i <= f1);
+}
+
+// Ridge Caps: near the centre of a curved part of the outline (see
+// _cap_ends), the line ending there is drawn from that list (rounded end),
+// and lines between the curved part's own faces are no lines.
+bool cap_skip(vec2 v, int a, int b, float reach)
+{
+	vec2 na = texelFetch(edges, ivec2(a, 1), 0).xy;
+	vec2 nb = texelFetch(edges, ivec2(b, 1), 0).xy;
+	bool hit = false;
+	for (int k = 0; k < cap_ends; k++)
+	{
+		vec4 rec = texelFetch(edges, ivec2(k, 4), 0);
+		if (length(v - rec.zw) < reach)
+		{
+			vec4 rg = texelFetch(edges, ivec2(k, 5), 0);
+			int f0 = int(rg.z + 0.5);
+			int f1 = int(rg.w + 0.5);
+			vec2 nx = texelFetch(edges, ivec2(int(rec.x + 0.5), 1), 0).xy;
+			vec2 ny = texelFetch(edges, ivec2(int(rec.y + 0.5), 1), 0).xy;
+			if ((dot(na, nx) > 0.766 && dot(nb, ny) > 0.766) || (dot(na, ny) > 0.766 && dot(nb, nx) > 0.766)
+				|| cap_in(a, f0, f1) || cap_in(b, f0, f1))
+			{
+				hit = true;
+			}
+		}
+	}
+	return hit;
+}
+
+// Ridge Caps: keeps the two caps with the lowest r (blended over one pixel
+// where they meet).
+void cap_keep(vec4 c, float r, inout vec4 c1, inout float r1, inout vec4 c2, inout float r2)
+{
+	if (c.a > 0.0)
+	{
+		if (r < r1)
+		{
+			c2 = c1;
+			r2 = r1;
+			c1 = c;
+			r1 = r;
+		}
+		else if (r < r2)
+		{
+			c2 = c;
+			r2 = r;
+		}
+	}
+}
+
+// Local position of a point given in the texture's rotated frame (braw).
+vec2 cap_local(vec2 b, vec2 size)
+{
+	vec2 w = b / size - 0.5;
+	float c = cos(rotation);
+	float s = sin(rotation);
+	return size * (vec2(c * w.x - s * w.y, s * w.x + c * w.y) + 0.5);
+}
+
 void vertex()
 {
 	v_local = VERTEX;
@@ -822,6 +1325,14 @@ void fragment()
 	// Change of seam_d per local unit, known exactly (screen derivatives
 	// break on the seam itself, where seam_d has a kink).
 	float seam_g = 1.0;
+	// Hip roofs: the face this pixel is on, and its distance (Ridge Caps).
+	int cap_f0 = -1;
+	float cap_d0 = 0.0;
+	// Round Ends (Gap Free, Two Slopes): pixel in a round end, its coverage
+	// (anti-aliased rim) and distance to the rim (texels).
+	bool in_round = false;
+	float round_keep = 1.0;
+	float round_rim = 0.0;
 	if (roof_mode == 2)
 	{
 		vec2 p = v_local - center;
@@ -1026,26 +1537,10 @@ void fragment()
 		int bi2 = 0;
 		for (int i = 0; i < edge_count; i++)
 		{
-			vec4 e = texelFetch(edges, ivec2(i, 0), 0);
-			vec4 fl = texelFetch(edges, ivec2(i, 1), 0);
-			vec4 nb = texelFetch(edges, ivec2(i, 2), 0);
-			vec2 ab = e.zw - e.xy;
-			float h = dot(v_local - e.xy, ab) / max(dot(ab, ab), 0.000001);
 			// Past an inner (reflex) corner the edge plane keeps going, on the
 			// far side of the valley (corner bisector) only: there it is the
-			// higher of the two planes. Near its own extension line it would
-			// drop to eave height inside the roof.
-			bool inner = dot(v_local - e.xy, fl.xy) <= 0.0;
-			bool ext = (h >= 0.0 && h <= 1.0)
-				|| (inner && h < 0.0 && fl.z > 0.5 && dot(v_local - e.xy, nb.xy + normalize(ab)) > 0.0)
-				|| (inner && h > 1.0 && fl.w > 0.5 && dot(v_local - e.zw, normalize(ab) + nb.zw) < 0.0);
-			float dd = ext ? abs(dot(v_local - e.xy, fl.xy)) : length(v_local - e.xy - ab * clamp(h, 0.0, 1.0));
-			// Around an inner corner the distance to the corner point is not
-			// a roof face (round swirl, and a false seam next to the valley).
-			if (!ext && ((h < 0.0 && fl.z > 0.5) || (h > 1.0 && fl.w > 0.5)))
-			{
-				dd = 100000000.0;
-			}
+			// higher of the two planes (see hip_face_d).
+			float dd = hip_face_d(v_local, i);
 			if (dd < best)
 			{
 				best2 = best;
@@ -1059,6 +1554,8 @@ void fragment()
 				bi2 = i;
 			}
 		}
+		cap_f0 = bi;
+		cap_d0 = best;
 		seam_d = best2 - best;
 		seam_g = length(texelFetch(edges, ivec2(bi, 1), 0).xy - texelFetch(edges, ivec2(bi2, 1), 0).xy);
 		vec4 e0 = texelFetch(edges, ivec2(bi, 0), 0);
@@ -1091,16 +1588,16 @@ void fragment()
 		base.x /= tex_scale;
 		base.x += u_offset;
 		vec2 bp = base * size;
-		vec2 gx = dFdx(bp);
-		vec2 gy = dFdy(bp);
+		vec2 gx = dFdx(bp) * vec2(1.0, pitch_scale);
+		vec2 gy = dFdy(bp) * vec2(1.0, pitch_scale);
 		lod = 0.5 * log2(max(max(dot(gx, gx), dot(gy, gy)), 0.00000001));
-		t = (v_max - base.y) * size.y;
+		t = (v_max - base.y) * size.y * pitch_scale;
 		ux = base.x;
 		face_n = normalize(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
 		if (mirror)
 		{
 			// Far slope = near slope turned 180° (+ ridge offset).
-			float tf = (base.y - v_min) * size.y;
+			float tf = (base.y - v_min) * size.y * pitch_scale;
 			float uf = ridge_offset - base.x;
 			vec2 nf2 = -face_n;
 			if (tf < t)
@@ -1110,13 +1607,75 @@ void fragment()
 				vec2 nn2 = face_n; face_n = nf2; nf2 = nn2;
 			}
 			seam_d = tf - t;
-			seam_g = 2.0 * size.y * length(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
+			seam_g = 2.0 * size.y * pitch_scale * length(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
 			if (seam_soft > 0.0)
 			{
 				t2 = tf;
 				ux2 = uf;
 				face_n2 = nf2;
 				w2 = 0.5 * clamp(1.0 - (tf - t) / seam_soft, 0.0, 1.0);
+			}
+			if (round_start || round_end)
+			{
+				// Round Ends: half a cone around each end of the ridge, rows
+				// following the rim; its tiles meet those of both slopes and
+				// the two halves meet on the line of the ridge.
+				vec2 braw = rotate_uv(v_local / size, rotation) * size;
+				float yc = (v_max + v_min) * 0.5 * size.y;
+				float rr = (v_max - v_min) * 0.5 * size.y;
+				float side = 0.0;
+				float xc = 0.0;
+				if (round_start && braw.x < round_x0)
+				{
+					side = -1.0;
+					xc = round_x0;
+				}
+				else if (round_end && braw.x > round_x1)
+				{
+					side = 1.0;
+					xc = round_x1;
+				}
+				if (side != 0.0)
+				{
+					in_round = true;
+					vec2 q = vec2(braw.x - xc, braw.y - yc);
+					float ra = max(round_a, 0.001);
+					float rho = length(vec2(q.x / ra, q.y / rr));
+					float rmin = min(ra, rr);
+					float px_t = max(max(length(dx), length(dy)), 0.0001);
+					round_keep = clamp((1.0 - rho) * rmin / px_t + 0.5, 0.0, 1.0);
+					round_rim = (1.0 - rho) * rmin;
+					t = max(1.0 - rho, 0.0) * rr * pitch_scale;
+					// Courses of tiles: one ring each (same shape as the rim),
+					// so the tile edges stay square to the rim.
+					float rh = max(row_h, 1.0);
+					float t0 = mod(size.y - edge_shift - row_y0, rh);
+					float kf = max(floor((t - t0) / rh), 0.0);
+					float t_mid = kf < 0.5 ? (t0 + rh) * 0.5 : t0 + (kf + 0.5) * rh;
+					float rho_k = max(1.0 - t_mid / (rr * pitch_scale), 0.25 * rh / rr);
+					float wtex = size.x * tex_scale;
+					// Angle on the ellipse: 0 at the near slope, pi at the far one.
+					float phi = atan(side * q.x / ra, q.y / rr);
+					float s_near = rho_k * round_arc(phi, ra, rr);
+					float s_far = rho_k * round_arc(3.14159265 - phi, ra, rr);
+					float u_j = xc / wtex + u_offset;
+					float u_near = u_j + side * s_near / wtex;
+					float u_far = ridge_offset - u_j - side * s_far / wtex;
+					vec2 ax = normalize(vec2(cos(rotation) / size.x, sin(rotation) / size.y));
+					vec2 ay = normalize(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
+					vec2 en = vec2(q.x / (ra * ra), q.y / (rr * rr));
+					face_n = length(en) > 0.0000001 ? normalize(en.x * ax + en.y * ay) : ay;
+					face_n2 = face_n;
+					ux = phi < 1.5707963 ? u_near : u_far;
+					t2 = t;
+					w2 = 0.0;
+					seam_d = 100000000.0;
+					if (seam_soft > 0.0)
+					{
+						ux2 = phi < 1.5707963 ? u_far : u_near;
+						w2 = 0.5 * clamp(1.0 - abs(phi - 1.5707963) * rho_k * rr / seam_soft, 0.0, 1.0);
+					}
+				}
 			}
 		}
 		h_own = t;
@@ -1179,12 +1738,12 @@ void fragment()
 	// cut-out bottom edge, and always the sides that are not an eave (Gap
 	// Free gable ends, Centered walls the top was moved onto, thicker as
 	// the top gets closer).
-	if (edge_count > 0 && side_ink)
+	if (edge_count > 0 && side_ink && !in_round)
 	{
 		vec2 odx = dFdx(v_local);
 		vec2 ody = dFdy(v_local);
 		float opx = max(max(length(odx), length(ody)), 0.000001);
-		float o_ink = max(max(row_h, 1.0) * 0.04, opx * 1.5);
+		float o_ink = max(ink_h * 0.04, opx * 1.5);
 		vec2 eave_n = normalize(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
 		float dark = 0.0;
 		for (int i = 0; i < edge_count; i++)
@@ -1196,6 +1755,17 @@ void fragment()
 				if (!(c > 0.7 || (mirror && c < -0.7)))
 				{
 					wgt = 1.0;
+				}
+				if (mirror && (round_start || round_end))
+				{
+					// The ends a Round End is added to are not cut.
+					vec4 er = texelFetch(edges, ivec2(i, 0), 0);
+					float xa = rotate_uv(er.xy / size, rotation).x * size.x;
+					float xb = rotate_uv(er.zw / size, rotation).x * size.x;
+					if ((round_start && max(xa, xb) <= round_x0 + 1.0) || (round_end && min(xa, xb) >= round_x1 - 1.0))
+					{
+						wgt = 0.0;
+					}
 				}
 			}
 			else if (roof_mode == 2 && apex_moved)
@@ -1220,10 +1790,10 @@ void fragment()
 	vec2 sdx = dFdx(v_local);
 	vec2 sdy = dFdy(v_local);
 	float spx = max(max(length(sdx), length(sdy)), 0.000001);
-	if (seam_soft <= 0.0 && seam_d < 10000000.0 && (roof_mode == 3 || (roof_mode == 1 && mirror)))
+	if (seam_lines && !ridge_caps && seam_soft <= 0.0 && seam_d < 10000000.0 && (roof_mode == 3 || (roof_mode == 1 && mirror)))
 	{
 		float ds = seam_d / max(seam_g, 0.0001);
-		float srh = max(row_h, 1.0);
+		float srh = ink_h;
 		float s_ink = max(srh * 0.03, spx);
 		float s_shadow = srh * 0.6;
 		if (ds < s_shadow && shade > 0.0)
@@ -1240,7 +1810,164 @@ void fragment()
 			texel *= mix(1.0, 0.12, (1.0 - smoothstep(s_ink * 0.5, s_ink, ds)) * ink_a);
 		}
 	}
-	float keep = 1.0;
+	if (in_round && side_ink && !eave_cut)
+	{
+		// Plain eave all around the round end: ink line on the rim.
+		float rpx = max(max(length(dx), length(dy)), 0.000001);
+		float r_ink = max(ink_h * 0.04, rpx * 1.5);
+		texel *= mix(1.0, 0.12, (1.0 - smoothstep(r_ink * 0.5, r_ink, round_rim)) * ink_a);
+	}
+	if (ridge_caps)
+	{
+		float cpx = max(max(length(dx), length(dy)), 0.0001);
+		float cap_sh = 0.0;
+		// The two caps with the lowest r (see crease_cap).
+		vec4 cap_1 = vec4(0.0);
+		vec4 cap_2 = vec4(0.0);
+		float r_1 = 100.0;
+		float r_2 = 100.0;
+		float hw_max = cap_base * 1.15 * cap_scale * 0.5;
+		if (roof_mode == 3)
+		{
+			// The lines bounding this pixel's face: with the nearest face
+			// turned away from it (b1) and the nearest turned away from both
+			// (b2). Faces turned by less than ~40° are one curved surface.
+			int fa = cap_f0;
+			vec2 na = texelFetch(edges, ivec2(fa, 1), 0).xy;
+			int b1 = -1;
+			int b2 = -1;
+			int b3 = -1;
+			float d1 = 100000000.0;
+			float d2 = 100000000.0;
+			float d3 = 100000000.0;
+			vec2 n1 = vec2(0.0);
+			for (int e = 0; e < edge_count; e++)
+			{
+				vec2 ne = texelFetch(edges, ivec2(e, 1), 0).xy;
+				bool virt = false;
+				float de = 100000000.0;
+				if (e != fa && dot(ne, na) <= 0.766)
+				{
+					de = cap_face_d(v_local, e, virt);
+				}
+				if (virt)
+				{
+					// Plane running on past a sharp inner corner: a third
+					// candidate (its line, if any, ends at the valley's top).
+					if (de < d3)
+					{
+						b3 = e;
+						d3 = de;
+					}
+				}
+				else if (de < 10000000.0)
+				{
+					if (de < d1)
+					{
+						if (b1 >= 0 && dot(n1, ne) <= 0.766)
+						{
+							b2 = b1;
+							d2 = d1;
+						}
+						else if (b2 >= 0 && dot(texelFetch(edges, ivec2(b2, 1), 0).xy, ne) > 0.766)
+						{
+							b2 = -1;
+							d2 = 100000000.0;
+						}
+						b1 = e;
+						d1 = de;
+						n1 = ne;
+					}
+					else if (de < d2 && dot(n1, ne) <= 0.766)
+					{
+						b2 = e;
+						d2 = de;
+					}
+				}
+			}
+			float reach = hw_max * 1.8;
+			// Lines ending at the centre of a curved part: rounded end there.
+			for (int k = 0; k < cap_ends; k++)
+			{
+				vec4 rec = texelFetch(edges, ivec2(k, 4), 0);
+				if (length(v_local - rec.zw) < reach)
+				{
+					float rk;
+					vec4 ck = crease_cap(v_local, int(rec.x + 0.5), int(rec.y + 0.5), true, rec.zw, -texelFetch(edges, ivec2(k, 5), 0).xy, COLOR, size, cpx, cap_sh, rk);
+					cap_keep(ck, rk, cap_1, r_1, cap_2, r_2);
+				}
+			}
+			// The cap can only reach this pixel when the faces' heights are
+			// close (|s| < 1.7 half widths, |n_a - n_b| <= 2).
+			float near_d = hw_max * 3.4;
+			for (int c = 0; c < 3; c++)
+			{
+				int bc = c == 0 ? b1 : (c == 1 ? b2 : b3);
+				float dc = c == 0 ? d1 : (c == 1 ? d2 : d3);
+				// The other lines it may end at.
+				int o1 = c == 0 ? b2 : b1;
+				int o2 = c == 2 ? b2 : b3;
+				if (bc >= 0 && dc - cap_d0 < near_d && !cap_bridged(v_local, fa, bc, dc) && !cap_skip(v_local, fa, bc, reach))
+				{
+					float rk;
+					vec2 jx;
+					vec2 jd;
+					bool je = cap_end(fa, bc, o1, jx, jd);
+					if (!je)
+					{
+						je = cap_end(fa, bc, o2, jx, jd);
+					}
+					vec4 ck = crease_cap(v_local, fa, bc, je, jx, jd, COLOR, size, cpx, cap_sh, rk);
+					cap_keep(ck, rk, cap_1, r_1, cap_2, r_2);
+				}
+			}
+		}
+		else if (roof_mode == 1 && mirror)
+		{
+			// Gap Free, Two Slopes: one ridge along the shape, ending rounded
+			// at the centre of each round end.
+			float hw = hw_max;
+			vec2 gr = vec2(-sin(rotation) / size.x, cos(rotation) / size.y);
+			vec2 gn = normalize(gr);
+			vec2 along = vec2(-gn.y, gn.x);
+			vec2 braw = rotate_uv(v_local / size, rotation) * size;
+			float yc = (v_max + v_min) * 0.5 * size.y;
+			float sx = (braw.y - yc) / (size.y * length(gr)) / hw;
+			float et = 0.0;
+			vec2 end_dir = vec2(0.0);
+			if (round_start || round_end)
+			{
+				// Way the ridge runs toward round_x1.
+				vec2 xdir = dot(along, vec2(cos(rotation), sin(rotation) * size.x / size.y)) >= 0.0 ? along : -along;
+				if (round_start)
+				{
+					float e0 = dot(v_local - cap_local(vec2(round_x0, yc), size), -xdir) / hw;
+					if (e0 > et)
+					{
+						et = e0;
+						end_dir = -xdir;
+					}
+				}
+				if (round_end)
+				{
+					float e1 = dot(v_local - cap_local(vec2(round_x1, yc), size), xdir) / hw;
+					if (e1 > et)
+					{
+						et = e1;
+						end_dir = xdir;
+					}
+				}
+			}
+			vec4 ck = cap_piece(dot(v_local, along), sx, et, gn, end_dir, hw, COLOR, size, cpx, cap_sh);
+			cap_keep(ck, length(vec2(sx, max(et, 0.0))), cap_1, r_1, cap_2, r_2);
+		}
+		texel *= 1.0 - 0.35 * cap_sh * cap_sh * ink_a;
+		// Where two caps meet (mitred), blend them over about a pixel.
+		float cw = cap_2.a > 0.0 ? clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0) : 1.0;
+		vec4 cap_c = mix(cap_2, cap_1, cw);
+		texel = mix(texel, cap_c.rgb, cap_c.a);
+	}
+	float keep = round_keep;
 	if (merge_on)
 	{
 		// Where the roof below rises higher, it shows through: the two
@@ -1256,7 +1983,9 @@ void fragment()
 		// garbage derivatives on the shape's own border cannot make a far cut
 		// look close.
 		float gdh = clamp(length(vec2(dFdx(dh), dFdy(dh))) / px_w, 0.05, 6.0);
-		float ink_w = max(max(row_h, 1.0) * 0.06, px_w * 2.0);
+		// Ink line on the junction: half on each roof (thin).
+		float ink_w = junction_ink > 0.0 ? max(ink_h * 0.054 * junction_ink, px_w * 0.9 * min(junction_ink, 1.0)) : 0.0;
+		float cut_band = 0.0;
 		bool kept = true;
 		float d_edge = 100000000.0;
 		if (hb >= 0.0)
@@ -1264,12 +1993,40 @@ void fragment()
 			float sd = dh / max(gdh, 0.0001);
 			kept = sd >= 0.0;
 			d_edge = abs(sd);
-			keep = clamp(sd / px_w + 0.5, 0.0, 1.0);
+			// Faces lying in the same plane (roofs sharing an edge and a
+			// slope): no junction line there, nor valley shadow.
+			if (length(vec2(dFdx(dh), dFdy(dh))) / px_w < 0.02)
+			{
+				d_edge = 100000000.0;
+			}
+			keep *= clamp(sd / px_w + 0.5, 0.0, 1.0);
 		}
-		if (kept && d_edge < ink_w)
+		if (kept && d_edge < valley_w)
 		{
-			// Ink line on the cut edge, like the outlines of the tiles.
-			texel *= mix(1.0, 0.12, (1.0 - smoothstep(ink_w * 0.5, ink_w, d_edge)) * ink_a);
+			// Valley shadow on this roof too (the roof below gets the same
+			// one from the skirt): darkest on the line, fading out smoothly.
+			texel *= 1.0 - valley_strength * valley_fade(1.0 - d_edge / max(valley_w, 0.001)) * ink_a;
+		}
+		if (d_edge < ink_w)
+		{
+			float jband = 1.0 - smoothstep(ink_w * 0.5, ink_w, d_edge);
+			if (kept)
+			{
+				texel *= mix(1.0, 0.12, jband * ink_a);
+				// No see-through seam between the two halves.
+				keep = max(keep, jband);
+			}
+			else
+			{
+				// The other half, drawn over the roof below.
+				cut_band = 0.88 * jband;
+			}
+		}
+		if (!kept && cut_band > 0.0)
+		{
+			texel = vec3(0.0);
+			alpha = cut_band;
+			keep = 1.0;
 		}
 	}
 	COLOR = vec4(texel, alpha * keep);
@@ -1280,7 +2037,8 @@ void fragment()
 var _shader: Shader = null
 var _tex_info := {}       # texture instance id -> analysis Dictionary
 var _states := {}         # "node-id-N" -> {"mat", "sig", "lut"}
-var _tool_cfg := {"enabled": false, "mode": MODE_FILL, "mirror": false}   # Pattern Tool: next shapes
+const TOOL_DEFAULTS = {"enabled": false, "mode": MODE_FILL, "mirror": false, "round_ends": 0, "merge": false, "seams": SEAMS_SOFT}
+var _tool_cfg := TOOL_DEFAULTS.duplicate()   # Pattern Tool: next shapes (reset with every map)
 var _world_ref = null
 var _pruned := false
 var _prev_next_id := -1
@@ -1304,7 +2062,6 @@ func initialize() -> void:
 		if stale != null:
 			stale.name = BAKE_HOLDER + "Old"
 			stale.queue_free()
-	_load_tool_cfg()
 	_build_ui()
 	# Other mods find this instance here (weak: a mods reload frees it).
 	Engine.set_meta(API_META, weakref(self))
@@ -1319,6 +2076,7 @@ func update(_delta) -> void:
 	if _g.World != _world_ref:
 		_world_ref = _g.World
 		_drop_all_states()
+		_reset_tool_cfg()
 		_pruned = false
 		_prev_next_id = -1
 		_sel_sig = ""
@@ -1382,10 +2140,23 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["edge", "u_offset", "merge_height", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in ["repeat", "cap_bright", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
 		out[k] = float(out[k])
-	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock"]:
+	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps"]:
 		out[k] = bool(out[k])
+	# Seams: older roofs only have Softer Seams / Ridge Caps.
+	if not (cfg is Dictionary and cfg.has("seams")):
+		out["seams"] = SEAMS_CAPS if out["ridge_caps"] else (SEAMS_SOFT if out["soft_seams"] else SEAMS_LINE)
+	out["seams"] = int(clamp(int(out["seams"]), SEAMS_NONE, SEAMS_CAPS))
+	out["soft_seams"] = out["seams"] >= SEAMS_SOFT
+	out["ridge_caps"] = out["seams"] == SEAMS_CAPS
+	# Cap Outline: None / Line / Blurred (older roofs: on / off).
+	if cfg is Dictionary and not cfg.has("cap_outline") and cfg.has("cap_ink"):
+		out["cap_outline"] = 1 if bool(cfg["cap_ink"]) else 0
+	out.erase("cap_ink")
+	out["cap_outline"] = int(clamp(int(out["cap_outline"]), 0, 2))
+	out["round_ends"] = int(clamp(int(out["round_ends"]), 0, 3))
+	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, 2))
 	return out
 
 
@@ -1424,6 +2195,9 @@ func _detect_new_shapes(store: Dictionary) -> void:
 				var cfg = _full_cfg({})
 				cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
 				cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
+				cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
+				cfg["merge"] = bool(_tool_cfg.get("merge", false))
+				cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
 				store["node-id-" + str(nid)] = cfg
 	elif active != "PatternShapeTool":
 		# Paste / duplicate (Select Tool), prefabs...: new pattern shapes are
@@ -1811,7 +2585,8 @@ func _update_skirt(node, mat: ShaderMaterial, cfg: Dictionary, st: Dictionary = 
 	var tex = mat.get_shader_param("albedo")
 	var bkey = str([hash(node.polygon), full["mode"], full["apex_on"], full["apex_x"], full["apex_y"],
 		node.get_global_transform() if full["apex_on"] and full["apex_lock"] else null,
-		full["edge"], full["pitch"], full["mirror"], full["soft_seams"], full["merge_height"],
+		full["edge"], full["pitch"], full["mirror"], full["round_ends"], full["seams"], full["merge_height"],
+		full["valley_width"], full["valley_opacity"],
 		mat.get_shader_param("rotation"), tex.get_instance_id() if tex != null else 0,
 		m.get("sig", "") if m != null else ""])
 	var sk = node.get_node_or_null(SKIRT_NAME)
@@ -1821,7 +2596,8 @@ func _update_skirt(node, mat: ShaderMaterial, cfg: Dictionary, st: Dictionary = 
 		return
 	st["bake_key"] = bkey
 	var rh = mat.get_shader_param("row_h")
-	var w = min(max(float(rh) if rh != null else 64.0, 1.0) * 0.3, 40.0)
+	var vw = mat.get_shader_param("valley_w")
+	var w = max(float(vw) if vw != null else _valley_w(min(float(rh), 128.0) if rh != null else 64.0), 1.0)
 	# Area covered (shape space): the shape's box plus the reach of the shadow.
 	var poly: PoolVector2Array = node.polygon
 	var rect = Rect2(poly[0], Vector2.ZERO)
@@ -2361,16 +3137,45 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	var mode = int(cfg.get("mode", MODE_FILL))
 	mat.set_shader_param("roof_mode", mode)
 	mat.set_shader_param("band_start", info["band_start"])
-	mat.set_shader_param("band", info["band"])
+	# Repeat Point: moves where the repeated band of the texture wraps.
+	var band = clamp(info["band"] + float(cfg.get("repeat", 0.0)), 8.0, max(info["h"] - info["band_start"], 8.0))
+	mat.set_shader_param("band", band)
 	mat.set_shader_param("edge_shift", info["empty"] + float(cfg.get("edge", 0.0)))
 	mat.set_shader_param("fade", info.get("fade", 0.0))
 	mat.set_shader_param("body_end", info.get("body_end", info["h"]))
 	mat.set_shader_param("eave_band", max(info["h"] - info["empty"] - float(cfg.get("edge", 0.0)) - info.get("body_end", info["h"]), 0.0))
 	# Softer Seams: width (texels) of the blend across ridges / hip lines.
-	var soft = max(16.0, info["h"] * 0.035) if bool(cfg.get("soft_seams", true)) else 0.0
+	var seams = int(cfg.get("seams", SEAMS_SOFT))
+	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and bool(cfg.get("mirror", false)))
+	# Ridge Caps where there are none: soft seams.
+	if seams == SEAMS_CAPS and not caps_ok:
+		seams = SEAMS_SOFT
+	var soft = max(16.0, info["h"] * 0.035) if seams >= SEAMS_SOFT else 0.0
+	mat.set_shader_param("seam_lines", seams != SEAMS_NONE)
 	mat.set_shader_param("seam_soft", soft)
 	mat.set_shader_param("tex_scale", _tex_scale(cfg))
 	mat.set_shader_param("side_ink", bool(cfg.get("side_ink", true)))
+	mat.set_shader_param("ridge_caps", seams == SEAMS_CAPS)
+	mat.set_shader_param("cap_outline", int(cfg.get("cap_outline", 1)))
+	# Cap Brightness -100..100 %: gamma 2 .. 0.5.
+	mat.set_shader_param("cap_gamma", pow(2.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0))
+	mat.set_shader_param("cap_scale", clamp(float(cfg.get("cap_width", 100.0)), 10.0, 500.0) / 100.0)
+	# Cap width from the tile rows (textures without rows: a quarter of the
+	# texture height at most).
+	var crh = float(info.get("row_h", info["h"]))
+	if crh >= info["h"] * 0.9:
+		# No tile rows found (thatch...).
+		crh = min(info["h"] * 0.25, 80.0)
+	var tn = float(info.get("tile_n", 0.0))
+	var cstyle = int(cfg.get("cap_style", 0))
+	if cstyle == 0:
+		# Auto: narrow single tiles (half-round tiles...) are turned along the
+		# line, anything else (slates, bricks, thatch...) laid as a band.
+		cstyle = 1 if tn > 0.0 and info["w"] / tn <= crh * 1.2 else 2
+	mat.set_shader_param("cap_style", cstyle)
+	mat.set_shader_param("ink_h", _ink_h(info))
+	# Cap width base: one tile (turned tiles) or one course (band).
+	mat.set_shader_param("cap_base", min(info["w"] / tn if cstyle == 1 and tn > 0.0 else crh, 128.0))
 	# The texture draws its own eave edge (transparent rows under the tiles).
 	mat.set_shader_param("eave_cut", info.get("body_end", info["h"]) < info["h"] - 0.5)
 	mat.set_shader_param("row_h", info.get("row_h", info["h"]))
@@ -2379,6 +3184,10 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	_set_light(mat, cfg, st)
 	_set_merge(mat, cfg, st)
 	mat.set_shader_param("merge_raise", float(cfg.get("merge_height", 0.0)))
+	# Merge settings (cog): junction line, valley shadow opacity and width.
+	mat.set_shader_param("valley_w", max(_valley_w(_ink_h(info)) * float(cfg.get("valley_width", 100.0)) / 100.0, 1.0))
+	mat.set_shader_param("valley_strength", clamp(float(cfg.get("valley_opacity", 35.0)) / 100.0, 0.0, 1.0))
+	mat.set_shader_param("junction_ink", max(float(cfg.get("valley_line", 100.0)) / 100.0, 0.0))
 	mat.set_shader_param("own_vis", _vis_offset(info, cfg))
 	if mode == MODE_CENTER:
 		_update_round(mat, poly, cfg, info, st)
@@ -2393,6 +3202,21 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 func _vis_offset(info: Dictionary, cfg: Dictionary) -> float:
 	var shift = info["empty"] + float(cfg.get("edge", 0.0))
 	return max(info["h"] - shift - info.get("vis_end", info["h"]), 0.0)
+
+
+# Size of ink lines and seam shadows: the tile row height, or a fixed share of
+# the texture when it has no rows (thatch, hay: the "row" would be the whole
+# texture, giving huge lines).
+func _ink_h(info: Dictionary) -> float:
+	var rh = float(info.get("row_h", info["h"]))
+	if rh >= info["h"] * 0.9:
+		rh = min(info["h"] * 0.25, 80.0)
+	return clamp(rh, 1.0, 128.0)
+
+
+# Width of the valley shadow of merged roofs (world px), from the tile row height.
+func _valley_w(row_h: float) -> float:
+	return min(max(row_h, 1.0) * 0.64, 84.0)
 
 
 func _set_merge(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary) -> void:
@@ -2428,7 +3252,7 @@ func _set_merge(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary) -> void:
 		var xf: Transform2D = e["xf"]
 		var r0 = pi * 5
 		var pitch = clamp(float(pcfg.get("pitch", 0.0)), 0.0, 80.0)
-		var pscale = 1.0 / cos(deg2rad(pitch)) if pmode != MODE_FILL else 1.0
+		var pscale = 1.0 / cos(deg2rad(pitch))
 		var center = Vector2.ZERO
 		var ref_d = 0.0
 		var star = 0.0
@@ -2466,6 +3290,8 @@ func _set_merge(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary) -> void:
 		else:
 			cost += float(n) * (3.0 if pmode == MODE_HIP else 1.0) + 8.0
 		img.set_pixel(4, r0, Color(size.x, size.y, vmax, vmin))
+		var pre = _round_ends(poly, size, rot, pcfg) if pmode == MODE_FILL else [false, false, 0.0, 0.0, 1.0]
+		img.set_pixel(5, r0, Color((1.0 if pre[0] else 0.0) + (2.0 if pre[1] else 0.0), pre[2], pre[3], pre[4]))
 		var ei = _edges_image(poly, n)
 		ei.lock()
 		for i in range(n):
@@ -2487,8 +3313,7 @@ func _set_merge(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary) -> void:
 
 func _set_light(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary = {}) -> void:
 	var pitch = clamp(float(cfg.get("pitch", 0.0)), 0.0, 80.0)
-	# Pitch only applies to Centered / Hip roofs.
-	mat.set_shader_param("pitch_scale", 1.0 / cos(deg2rad(pitch)) if int(cfg.get("mode", MODE_FILL)) != MODE_FILL else 1.0)
+	mat.set_shader_param("pitch_scale", 1.0 / cos(deg2rad(pitch)))
 	var strength = float(cfg.get("shade", 0.0))
 	var angle = float(cfg.get("light", 315.0))
 	var gl = _global_light()
@@ -2559,8 +3384,37 @@ func _update_fill(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary, 
 	# the two sides do not meet in a perfect mirror at the ridge.
 	mat.set_shader_param("ridge_offset", float(cfg.get("ridge_offset", 0.0)) / 100.0)
 	mat.set_shader_param("u_offset", float(cfg.get("u_offset", 0.0)) / 100.0)
-	# Pitch only applies to Centered / Hip roofs.
-	mat.set_shader_param("pitch_scale", 1.0)
+	var re = _round_ends(poly, size, rot, cfg)
+	mat.set_shader_param("round_start", re[0])
+	mat.set_shader_param("round_end", re[1])
+	mat.set_shader_param("round_x0", re[2])
+	mat.set_shader_param("round_x1", re[3])
+	mat.set_shader_param("round_a", re[4])
+
+
+# Round Ends (Gap Free + Two Slopes): [start on, end on, centre of the start
+# round end, centre of the end one (texels along the ridge, texture space),
+# length of the round ends along the ridge].
+func _round_ends(poly: PoolVector2Array, size: Vector2, rot: float, cfg) -> Array:
+	var ends = int(cfg.get("round_ends", 0)) if bool(cfg.get("mirror", false)) else 0
+	if ends <= 0 or poly.size() < 3:
+		return [false, false, 0.0, 0.0, 1.0]
+	var xmin = INF
+	var xmax = -INF
+	var ymin = INF
+	var ymax = -INF
+	for p in poly:
+		var b = _rotate_uv(p / size, rot) * size
+		xmin = min(xmin, b.x)
+		xmax = max(xmax, b.x)
+		ymin = min(ymin, b.y)
+		ymax = max(ymax, b.y)
+	# Half ellipses inside the shape: as long as the half width of the roof
+	# (a half cone), shorter on a short roof so they are never cut.
+	var r = (ymax - ymin) * 0.5
+	var a = min(r, (xmax - xmin) * (0.5 if ends == 3 else 1.0))
+	a = max(a, 0.001)
+	return [ends == 1 or ends == 3, ends >= 2, xmin + a, xmax - a, a]
 
 
 func _update_round(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary, info: Dictionary, st: Dictionary) -> void:
@@ -2633,7 +3487,9 @@ func _edges_image(poly: PoolVector2Array, n: int) -> Image:
 # Edge table shared by Hip roofs and faceted Centered roofs.
 # Row 0: a, b. Row 1: outward normal, reflex flags at a / b.
 # Row 2: direction of the previous edge, direction of the next edge.
-# Row 3: perpendicular distance from the top point to the edge line.
+# Row 3: perpendicular distance from the top point to the edge line, then
+# Ridge Caps data (part of a curved outline, S0, T': see _cap_runs).
+# Rows 4-5 (Ridge Caps): lines ending at a curved part (see _cap_ends).
 func _set_edges(mat: ShaderMaterial, poly: PoolVector2Array, apex: Vector2, st: Dictionary) -> void:
 	var n = poly.size()
 	if n < 3:
@@ -2645,14 +3501,19 @@ func _set_edges(mat: ShaderMaterial, poly: PoolVector2Array, apex: Vector2, st: 
 		area += poly[i].cross(poly[(i + 1) % n])
 	var sgn = 1.0 if area >= 0.0 else -1.0
 	var dirs = []
-	var cum = []
 	var acc = 0.0
 	for i in range(n):
 		dirs.append((poly[(i + 1) % n] - poly[i]).normalized())
-		cum.append(acc)
 		acc += poly[i].distance_to(poly[(i + 1) % n])
+	var nrm = []
+	var lens = []
+	for i in range(n):
+		nrm.append(Vector2(dirs[i].y, -dirs[i].x) * sgn)
+		lens.append(poly[i].distance_to(poly[(i + 1) % n]))
+	var runs = _cap_runs(n, dirs, nrm, lens, sgn)
+	var ends = _cap_ends(poly, n, dirs, nrm, sgn, runs["soft"], runs["tt"])
 	var img = Image.new()
-	img.create(n, 4, false, Image.FORMAT_RGBAF)
+	img.create(n, 6, false, Image.FORMAT_RGBAF)
 	img.lock()
 	for i in range(n):
 		var a = poly[i]
@@ -2660,14 +3521,18 @@ func _set_edges(mat: ShaderMaterial, poly: PoolVector2Array, apex: Vector2, st: 
 		var d_prev = dirs[(i - 1 + n) % n]
 		var d_this = dirs[i]
 		var d_next = dirs[(i + 1) % n]
-		var outn = Vector2(d_this.y, -d_this.x) * sgn
+		var outn = nrm[i]
 		var reflex_a = 1.0 if d_prev.cross(d_this) * sgn < -0.0001 else 0.0
 		var reflex_b = 1.0 if d_this.cross(d_next) * sgn < -0.0001 else 0.0
 		var apex_d = max((a - apex).dot(outn), 0.001)
 		img.set_pixel(i, 0, Color(a.x, a.y, b.x, b.y))
 		img.set_pixel(i, 1, Color(outn.x, outn.y, reflex_a, reflex_b))
 		img.set_pixel(i, 2, Color(d_prev.x, d_prev.y, d_next.x, d_next.y))
-		img.set_pixel(i, 3, Color(apex_d, cum[i], 0.0, 0.0))
+		img.set_pixel(i, 3, Color(apex_d, runs["curved"][i], runs["s0"][i], runs["tp"][i]))
+	for k in range(ends.size()):
+		var e = ends[k]
+		img.set_pixel(k, 4, Color(e[0], e[1], e[2].x, e[2].y))
+		img.set_pixel(k, 5, Color(e[3].x, e[3].y, e[4], e[5]))
 	img.unlock()
 	var etex = st.get("edges")
 	if etex == null:
@@ -2676,7 +3541,180 @@ func _set_edges(mat: ShaderMaterial, poly: PoolVector2Array, apex: Vector2, st: 
 	etex.create_from_image(img, 0)
 	mat.set_shader_param("edges", etex)
 	mat.set_shader_param("edge_count", n)
+	mat.set_shader_param("cap_ends", ends.size())
 	st["perimeter"] = acc
+
+
+# Ridge Caps on Hip roofs: runs of faces joined at small turns (curved
+# outlines). Per face: part of such a run (1 / 0), and S0, T' such that a
+# point of a ridge at depth d is at S0 + (along the face) - d * T' along the
+# run, unbroken from one face to the next (ridge tiles follow curves).
+func _cap_runs(n: int, dirs: Array, nrm: Array, lens: Array, sgn: float) -> Dictionary:
+	var soft = []
+	var tt = []
+	for i in range(n):
+		var ip = (i - 1 + n) % n
+		var ok = nrm[ip].dot(nrm[i]) > CAP_SIM
+		soft.append(ok)
+		# tan(half the turn at the vertex), > 0 at outer corners.
+		var turn = atan2(dirs[ip].cross(dirs[i]), dirs[ip].dot(dirs[i])) * sgn
+		tt.append(tan(turn * 0.5) if ok else 0.0)
+	var start = -1
+	for i in range(n):
+		if not soft[i]:
+			start = i
+			break
+	if start < 0:
+		# Curved all around: start where it turns the most.
+		start = 0
+		for i in range(n):
+			if abs(tt[i]) > abs(tt[start]):
+				start = i
+	var curved = []
+	var s0 = []
+	var tp = []
+	for i in range(n):
+		curved.append(1.0 if soft[i] or soft[(i + 1) % n] else 0.0)
+		s0.append(0.0)
+		tp.append(0.0)
+	var run = []
+	var acc_s = 0.0
+	var acc_t = 0.0
+	for k in range(n + 1):
+		var i = (start + k) % n
+		if k == 0 or k == n or not soft[i]:
+			# Close the run, centred on its middle.
+			for j in run:
+				s0[j] -= acc_s * 0.5
+			run = []
+			acc_s = 0.0
+			acc_t = 0.0
+			if k == n:
+				break
+		var ta = tt[i] if run.size() > 0 else 0.0
+		tp[i] = acc_t + ta
+		s0[i] = acc_s
+		var nx = (i + 1) % n
+		var tb = tt[nx] if soft[nx] and nx != start else 0.0
+		acc_t += ta + tb
+		acc_s += lens[i]
+		run.append(i)
+	return {"soft": soft, "tt": tt, "curved": curved, "s0": s0, "tp": tp}
+
+
+# Ridge Caps on Hip roofs: lines ending where a curved part of the outline
+# begins (round ends, rounded corners). The faces of a curved part all shrink
+# to about one point (its centre); the faces on both sides of the curved part
+# meet in a line that ends there. Each: [face, face, end point, direction
+# from the end along the line, first and last face of the curved part].
+func _cap_ends(poly: PoolVector2Array, n: int, dirs: Array, nrm: Array, sgn: float, soft: Array, tt: Array) -> Array:
+	var out = []
+	var pts = []
+	var dep = []
+	for i in range(n):
+		pts.append(null)
+		dep.append(0.0)
+		var ip = (i - 1 + n) % n
+		var inx = (i + 1) % n
+		if soft[i] and soft[inx] and tt[i] > 0.0 and tt[inx] > 0.0:
+			var p = _cap_junction(poly, nrm, ip, i, inx)
+			if p != null:
+				var d = (poly[i] - p).dot(nrm[i])
+				if d > 0.0 and Geometry.is_point_in_polygon(p, poly):
+					pts[i] = p
+					dep[i] = d
+	var first = -1
+	for i in range(n):
+		if pts[i] == null:
+			first = i
+			break
+	if first < 0:
+		return out
+	# Curved parts: consecutive faces shrinking to about the same point.
+	var groups = []
+	var cur = []
+	for k in range(1, n + 1):
+		var i = (first + k) % n
+		if pts[i] != null and cur.size() > 0:
+			var l = cur[cur.size() - 1]
+			if pts[i].distance_to(pts[l]) > 0.6 * min(dep[i], dep[l]):
+				groups.append(cur)
+				cur = []
+		if pts[i] != null:
+			cur.append(i)
+		elif cur.size() > 0:
+			groups.append(cur)
+			cur = []
+	for grp in groups:
+		if grp.size() < 2 or out.size() >= MAX_CAP_ENDS:
+			continue
+		var x = (grp[0] - 1 + n) % n
+		var y = (grp[grp.size() - 1] + 1) % n
+		if x == y or nrm[x].dot(nrm[y]) > CAP_SIM:
+			continue
+		var mid = grp[grp.size() / 2]
+		var p = _cap_junction(poly, nrm, x, y, mid)
+		if p == null:
+			continue
+		var g = nrm[x] - nrm[y]
+		var u = Vector2(-g.y, g.x).normalized()
+		if u.dot(nrm[mid] - nrm[x]) > 0.0:
+			u = -u
+		# The line must run on from there, between these two faces.
+		var q = p + u * max((poly[x] - p).dot(nrm[x]) * 0.2, 1.0)
+		var near = _cap_nearest2(poly, n, dirs, nrm, sgn, q)
+		if not ((near[0] == x and near[1] == y) or (near[0] == y and near[1] == x)):
+			continue
+		out.append([float(x), float(y), p, u, float(grp[0]), float(grp[grp.size() - 1])])
+	return out
+
+
+# Point at the same height on the planes of faces i, j and k (or null).
+func _cap_junction(poly: PoolVector2Array, nrm: Array, i: int, j: int, k: int):
+	var r1 = nrm[i] - nrm[j]
+	var r2 = nrm[i] - nrm[k]
+	var det = r1.x * r2.y - r1.y * r2.x
+	if abs(det) < 0.000001:
+		return null
+	var hi = poly[i].dot(nrm[i])
+	var c1 = hi - poly[j].dot(nrm[j])
+	var c2 = hi - poly[k].dot(nrm[k])
+	return Vector2(c1 * r2.y - c2 * r1.y, r1.x * c2 - r2.x * c1) / det
+
+
+# The two faces nearest to v, as the Hip shader measures (hip_face_d).
+func _cap_nearest2(poly: PoolVector2Array, n: int, dirs: Array, nrm: Array, sgn: float, v: Vector2) -> Array:
+	var b1 = -1
+	var b2 = -1
+	var d1 = INF
+	var d2 = INF
+	for i in range(n):
+		var a = poly[i]
+		var b = poly[(i + 1) % n]
+		var ab = b - a
+		var h = (v - a).dot(ab) / max(ab.length_squared(), 0.000001)
+		var d_prev = dirs[(i - 1 + n) % n]
+		var d_next = dirs[(i + 1) % n]
+		var ra = d_prev.cross(dirs[i]) * sgn < -0.0001
+		var rb = dirs[i].cross(d_next) * sgn < -0.0001
+		var inner = (v - a).dot(nrm[i]) <= 0.0
+		var ext = (h >= 0.0 and h <= 1.0) \
+			or (inner and h < 0.0 and ra and (v - a).dot(d_prev + dirs[i]) > 0.0) \
+			or (inner and h > 1.0 and rb and (v - b).dot(dirs[i] + d_next) < 0.0)
+		var d = INF
+		if ext:
+			d = abs((v - a).dot(nrm[i]))
+		elif not ((h < 0.0 and ra) or (h > 1.0 and rb)):
+			d = v.distance_to(a + ab * clamp(h, 0.0, 1.0))
+		if d < d1:
+			b2 = b1
+			d2 = d1
+			b1 = i
+			d1 = d
+		elif d < d2:
+			b2 = i
+			d2 = d
+	return [b1, b2]
 
 
 func _rotate_uv(uv: Vector2, r: float) -> Vector2:
@@ -3178,10 +4216,13 @@ func _build_ui() -> void:
 		var cfg = _full_cfg({})
 		cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
 		cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
+		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
+		cfg["merge"] = bool(_tool_cfg.get("merge", false))
+		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
 		_set_ui_values("tool", cfg, bool(_tool_cfg.get("enabled", false)))
 	var sp = toolset.GetToolPanel("SelectTool")
 	if sp != null and sp.get("Align") != null:
-		var anchor2 = _find_order_anchor(sp.Align, 0)
+		var anchor2 = _find_order_anchor(sp.Align, 0, sp)
 		if anchor2 == null:
 			anchor2 = _find_layer_anchor(sp.Align, 0)
 		_ui["select"] = _make_section(sp.Align, anchor2, UI_SELECT_NAME, "select", true, icon_roof, icon_reset)
@@ -3204,35 +4245,49 @@ func _load_icon(file_name: String, max_px: int) -> Texture:
 
 # Select Tool: the row holding the "Bring to Front" / "Send to Back" buttons
 # (matched on text or tooltip). null if not found.
-func _find_order_anchor(node: Node, depth: int):
-	var found = []
-	_collect_order_buttons(node, depth, found)
-	if found.empty():
-		return null
-	var b = found[found.size() - 1]
-	var parent = b.get_parent()
-	if parent is HBoxContainer or parent is GridContainer:
-		return parent
-	return b
+func _find_order_anchor(node: Node, depth: int, panel = null):
+	# DD's own row first: its layer section (shown for patterns). Other mods
+	# add buttons with the same text elsewhere (Minor Utils: "Bring to Front"
+	# / "Send to Back" for walls, in the wall options).
+	var sections = []
+	for owner_node in [panel, node.get_parent()]:
+		if owner_node != null and owner_node.get("layerSection") is Node:
+			sections.append(owner_node.get("layerSection"))
+	sections.append(node)
+	for strict in [true, false]:
+		for sec in sections:
+			var found = []
+			_collect_order_buttons(sec, depth, found, strict)
+			if found.empty():
+				continue
+			var b = found[0]
+			var parent = b.get_parent()
+			if parent is HBoxContainer or parent is GridContainer:
+				return parent
+			return b
+	return null
 
 
-func _collect_order_buttons(node: Node, depth: int, out: Array) -> void:
+func _collect_order_buttons(node: Node, depth: int, out: Array, strict: bool) -> void:
 	if depth > 6:
 		return
 	for child in node.get_children():
-		if child is BaseButton and _is_order_button(child):
+		if child is BaseButton and _is_order_button(child, strict):
 			out.append(child)
 		if child is Control and child.get_child_count() > 0:
-			_collect_order_buttons(child, depth + 1, out)
+			_collect_order_buttons(child, depth + 1, out, strict)
 
 
-# DD's buttons: text "BRING_TO_FRONT" / "SEND_TO_BACK" (translation keys,
-# shown translated), "pressed" connected to SelectTool.BringToFront / SendToBack.
-func _is_order_button(b: BaseButton) -> bool:
+# DD's buttons: "pressed" connected to SelectTool.BringToFront / SendToBack
+# (strict), or text "BRING_TO_FRONT" / "SEND_TO_BACK" (translation keys,
+# shown translated).
+func _is_order_button(b: BaseButton, strict: bool) -> bool:
 	for con in b.get_signal_connection_list("pressed"):
 		var m = str(con.get("method", ""))
 		if m == "BringToFront" or m == "SendToBack":
 			return true
+	if strict:
+		return false
 	var txt = (str(b.get("text")) + " " + str(b.hint_tooltip)).to_lower().replace("_", " ")
 	return txt.find("to front") >= 0 or txt.find("to back") >= 0
 
@@ -3306,13 +4361,40 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 	c["mirror"] = _make_toggle(opts, "Two Slopes",
 		"Draws an eave on both sides of the shape with a ridge in the\nmiddle (gable roof). The far slope is the near one turned 180°.\nThe texture rotation sets the ridge direction.",
 		section, "mirror")
+	c["round_ends"] = _make_option(opts, "Round Ends", ["Off", "Start", "End", "Both"],
+		"Rounds one end of the ridge (Start / End, along the texture's\ndirection) or both, inside the drawn shape: half a cone as\nwide as the roof, flatter on short roofs so it is never cut.",
+		section, "round_ends")
+	c["seams"] = _make_option(opts, "Seams", ["None", "Line", "Soft", "Ridge Caps"],
+		"Ridge and hip lines. None: plain cut. Line: ink line and a\nsmall shadow. Soft: the two sides blended over a few pixels.\nRidge Caps: a row of cap tiles made from the roof texture\n(Hip roofs, Gap Free with Two Slopes).",
+		section, "seams")
+	if not full:
+		c["merge"] = _make_toggle(opts, "Merge With Roof Below",
+			"The next roofs drawn join the roofs below them: where a roof\nbelow rises higher, it shows through, so the roofs meet on\ntheir real intersection line.",
+			section, "merge")
 	if full:
-		c["soft_seams"] = _make_toggle(opts, "Softer Seams",
-			"Blends the two sides of every ridge and hip line over a few\npixels instead of a hard cut. On Centered roofs it also hides\nthe seam left by a Tile Width that does not fit a whole number\nof tiles around the roof.",
-			section, "soft_seams")
 		c["side_ink"] = _make_toggle(opts, "Side Lines",
 			"Draws a dark outline on every side where the texture is plainly\ncut, whatever the drawn shape: eaves when the texture has no\ncut-out edge of its own, and always the sides that are not an\neave (gable ends, the sides a moved roof top is close to).",
 			section, "side_ink")
+		c["cap_style"] = _make_option(opts, "Cap Style", ["Auto", "Turned Tiles", "Texture Band"],
+			"Turned Tiles: one tile column of the texture turned along the\nline (half-round tiles). Texture Band: one course of the texture\nlaid along the line (slates, bricks, thatch...). Auto picks from\nthe texture.",
+			section, "cap_style")
+		c["cap_width"] = _make_slider(opts, "Cap Width", 30.0, 300.0, "%",
+			"Width of the ridge caps (ridges are always wider than hips).",
+			section, "cap_width", icon_reset)
+		c["cap_bright"] = _make_slider(opts, "Cap Brightness", -100.0, 100.0, "%",
+			"Brightness of the ridge caps (changes their gamma: darker\nor lighter than the roof).",
+			section, "cap_bright", icon_reset)
+		c["cap_outline"] = _make_option(opts, "Cap Outline", ["None", "Line", "Blurred"],
+			"Edge of the ridge caps: plain, a black ink line, or blurred\n(the cap fades out toward its sides).",
+			section, "cap_outline")
+		c["cap_sep"] = HSeparator.new()
+		opts.add_child(c["cap_sep"])
+		# Ridge Caps settings: under the Seams menu, shown with its cog.
+		c["seams_cog"] = _make_cog(section, "Ridge Caps settings: style, width, brightness and outline.")
+		c["seams"]["row"].add_child(c["seams_cog"])
+		c["seams"]["row"].move_child(c["seams_cog"], 1)
+		c["cap_box"] = _make_box(opts, c["seams"]["row"].get_index() + 1,
+			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_bright"]["row"], c["cap_outline"]["row"], c["cap_sep"]])
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
@@ -3320,9 +4402,38 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 			"Moves the roof top away from the centre of the shape.",
 			section, "apex_on")
 		c["apex_box"] = _make_apex_box(opts, c, section, icon_reset)
-		c["merge"] = _make_toggle(opts, "Merge With Roof Below",
-			"Joins this roof to the roof it overlaps the most among those\ndrawn below it: where that roof rises higher, it shows through,\nso the two roofs meet on their real intersection line.\nTip: put the roof with the most cut-out eave (round tiles,\nscales) on top, so its own edge is drawn over the other one.",
-			section, "merge")
+		# Label, cog, then the switch: the cog sits just left of ON/OFF.
+		var mtip = "Joins this roof to the roof it overlaps the most among those\ndrawn below it: where that roof rises higher, it shows through,\nso the two roofs meet on their real intersection line.\nTip: put the roof with the most cut-out eave (round tiles,\nscales) on top, so its own edge is drawn over the other one."
+		var mrow = HBoxContainer.new()
+		opts.add_child(mrow)
+		var mlbl = Label.new()
+		mlbl.text = "Merge With Roof Below"
+		mlbl.hint_tooltip = mtip
+		mlbl.mouse_filter = Control.MOUSE_FILTER_PASS
+		mlbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		mrow.add_child(mlbl)
+		var cog = _make_cog(section, "Merge settings: Merge Height, junction line and valley shadow.")
+		mrow.add_child(cog)
+		c["merge_cog"] = cog
+		c["merge"] = _make_toggle(mrow, "", mtip, section, "merge")
+		var mbox = VBoxContainer.new()
+		opts.add_child(mbox)
+		mbox.visible = false
+		c["merge_box"] = mbox
+		c["merge_sep"] = HSeparator.new()
+		opts.add_child(c["merge_sep"])
+		c["merge_height"] = _make_slider(mbox, "Merge Height", -1000.0, 1000.0, " px",
+			"Raises (+) or lowers (-) this roof against the roofs below it:\nhigher, it covers more of them; lower, they show through more.",
+			section, "merge_height", icon_reset)
+		c["valley_line"] = _make_slider(mbox, "Junction Line Width", 0.0, 400.0, "%",
+			"Width of the ink line where the roofs meet (100% = default,\n0% = no line).",
+			section, "valley_line", icon_reset)
+		c["valley_opacity"] = _make_slider(mbox, "Valley Shadow Opacity", 0.0, 100.0, "%",
+			"Darkness of the shadow on both roofs along the line where\nthey meet.",
+			section, "valley_opacity", icon_reset)
+		c["valley_width"] = _make_slider(mbox, "Valley Shadow Width", 0.0, 300.0, "%",
+			"Width of the valley shadow (100% = default, set from the\nheight of the tile rows).",
+			section, "valley_width", icon_reset)
 		c["global_light"] = _make_toggle(opts, "Global Lighting",
 			"One light for every roof of the map: Shading Strength and\nLight Direction then change all roofs at once.\nSaved with the map.",
 			section, "global_light")
@@ -3335,19 +4446,22 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["ridge_offset"] = _make_slider(opts, "Ridge Offset", -50.0, 50.0, "%",
 			"Shifts the far slope sideways (in % of the texture width) so\nthe tiles of both slopes do not line up perfectly at the ridge.",
 			section, "ridge_offset", icon_reset)
+		c["repeat"] = _make_slider(opts, "Repeat Point", -512.0, 512.0, " px",
+			"Moves where the texture repeats along the slope (the height of\nthe repeated band). Try it when a seam or a strong band shows\nwhere the texture starts over.",
+			section, "repeat", icon_reset)
 		c["edge"] = _make_slider(opts, "Edge Offset", -128.0, 128.0, " px",
 			"Moves the eave inward (+) or outward (-).\nThe empty rows under the eave are already removed automatically.",
 			section, "edge", icon_reset)
 		c["u_offset"] = _make_slider(opts, "Texture Offset", -100.0, 100.0, "%",
 			"Slides the texture sideways (in % of the texture width),\nwithout moving the shape.",
 			section, "u_offset", icon_reset)
-		c["merge_height"] = _make_slider(opts, "Merge Height", -300.0, 300.0, " px",
-			"Raises (+) or lowers (-) this roof against the roofs below it:\nhigher, it covers more of them; lower, they show through more.",
-			section, "merge_height", icon_reset)
 		c["pitch"] = _make_slider(opts, "Pitch", 0.0, 70.0, "°",
 			"Roof steepness: steeper roofs show more tile rows\nbetween the edge and the top.",
 			section, "pitch", icon_reset)
-		opts.move_child(c["shade_on"], c["pitch"]["row"].get_index() + 1)
+		c["shade_sep"] = HSeparator.new()
+		opts.add_child(c["shade_sep"])
+		opts.move_child(c["shade_sep"], c["pitch"]["row"].get_index() + 1)
+		opts.move_child(c["shade_on"], c["shade_sep"].get_index() + 1)
 		opts.move_child(c["global_light"], c["shade_on"].get_index() + 1)
 		c["shade"] = _make_slider(opts, "Shading Strength", 0.0, 100.0, "%",
 			"Strength of the light/shadow effect on the roof sides.",
@@ -3355,7 +4469,48 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["light"] = _make_slider(opts, "Light Direction", 0.0, 359.0, "°",
 			"Where the light comes from (0° = top, clockwise).",
 			section, "light", icon_reset)
+		# Texture Settings: one row with a cog showing them all.
+		var trow = HBoxContainer.new()
+		opts.add_child(trow)
+		opts.move_child(trow, c["scale"]["row"].get_index())
+		var tlbl = Label.new()
+		tlbl.text = "Texture Settings"
+		tlbl.hint_tooltip = "Tile Width, Ridge Offset, Repeat Point, Edge Offset, Texture\nOffset and Pitch."
+		tlbl.mouse_filter = Control.MOUSE_FILTER_PASS
+		tlbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		trow.add_child(tlbl)
+		c["tex_cog"] = _make_cog(section, "Show the texture settings.")
+		trow.add_child(c["tex_cog"])
+		c["tex_box"] = _make_box(opts, trow.get_index() + 1,
+			[c["scale"]["row"], c["ridge_offset"]["row"], c["repeat"]["row"], c["edge"]["row"], c["u_offset"]["row"], c["pitch"]["row"]])
 	return c
+
+
+# Settings cog: toggles a hidden group of settings (see _update_visibility).
+func _make_cog(section: String, tip: String) -> Button:
+	var cog = Button.new()
+	cog.toggle_mode = true
+	cog.flat = true
+	cog.focus_mode = Control.FOCUS_NONE
+	cog.hint_tooltip = tip
+	cog.icon = _load_icon("cog.png", RESET_ICON_PX)
+	if cog.icon == null:
+		cog.text = "..."
+	cog.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	cog.connect("toggled", self, "_on_merge_cog", [section])
+	return cog
+
+
+# Moves controls of opts into a new box at index (hidden until its cog is on).
+func _make_box(opts: Node, index: int, items: Array) -> VBoxContainer:
+	var box = VBoxContainer.new()
+	opts.add_child(box)
+	opts.move_child(box, index)
+	for it in items:
+		it.get_parent().remove_child(it)
+		box.add_child(it)
+	box.visible = false
+	return box
 
 
 func _make_mode_button(parent: Node, group: ButtonGroup, text: String, tip: String, mode: int, section: String) -> Button:
@@ -3411,6 +4566,40 @@ func _make_toggle(parent: Node, text: String, tip: String, section: String, fiel
 	t.connect("toggled", self, "_on_toggle_changed", [section, field])
 	parent.add_child(t)
 	return t
+
+
+func _make_option(parent: Node, text: String, items: Array, tip: String, section: String, field: String) -> Dictionary:
+	var row = HBoxContainer.new()
+	parent.add_child(row)
+	var lbl = Label.new()
+	lbl.text = text
+	lbl.hint_tooltip = tip
+	lbl.mouse_filter = Control.MOUSE_FILTER_PASS
+	row.add_child(lbl)
+	var ob = OptionButton.new()
+	ob.focus_mode = Control.FOCUS_NONE
+	ob.hint_tooltip = tip
+	ob.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	for i in range(items.size()):
+		ob.add_item(items[i], i)
+	ob.connect("item_selected", self, "_on_option_selected", [section, field])
+	row.add_child(ob)
+	return {"row": row, "option": ob}
+
+
+# Cog of Merge With Roof Below: shows / hides the merge settings.
+func _on_merge_cog(_pressed: bool, section: String) -> void:
+	_update_visibility(section)
+
+
+func _on_option_selected(index: int, section: String, field: String) -> void:
+	if _updating_ui:
+		return
+	if section == "tool":
+		_tool_cfg[field] = index
+		return
+	_apply_fields(section, {field: index})
+	_update_visibility(section)
 
 
 func _make_reset(icon_reset: Texture, tip: String) -> Button:
@@ -3676,23 +4865,31 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 	for m in c["modes"].keys():
 		c["modes"][m].pressed = full["mode"] == m
 	c["mirror"].pressed = full["mirror"]
+	c["round_ends"]["option"].select(full["round_ends"])
+	c["merge"].pressed = full["merge"]
+	c["seams"]["option"].select(full["seams"])
 	if c["full"]:
 		_set_ctl(c["ridge_offset"], full["ridge_offset"])
 		_set_ctl(c["scale"], full["scale"])
 		_set_ctl(c["edge"], full["edge"])
 		_set_ctl(c["u_offset"], full["u_offset"])
 		_set_ctl(c["merge_height"], full["merge_height"])
+		for vk in ["valley_line", "valley_opacity", "valley_width"]:
+			_set_ctl(c[vk], full[vk])
 		_set_ctl(c["pitch"], full["pitch"])
 		var gl = _global_light()
 		c["global_light"].pressed = gl["on"]
 		_set_ctl(c["shade"], (gl["shade"] if gl["on"] else full["shade"]) * 100.0)
 		_set_ctl(c["light"], gl["light"] if gl["on"] else full["light"])
 		c["taper"].pressed = full["taper"]
-		c["soft_seams"].pressed = full["soft_seams"]
+		_set_ctl(c["repeat"], full["repeat"])
 		c["apex_on"].pressed = full["apex_on"]
 		c["shade_on"].pressed = full["shade_on"]
-		c["merge"].pressed = full["merge"]
 		c["side_ink"].pressed = full["side_ink"]
+		c["cap_outline"]["option"].select(full["cap_outline"])
+		_set_ctl(c["cap_width"], full["cap_width"])
+		_set_ctl(c["cap_bright"], full["cap_bright"])
+		c["cap_style"]["option"].select(full["cap_style"])
 		c["apex_x"].value = round(full["apex_x"] * 100.0)
 		c["apex_y"].value = round(full["apex_y"] * 100.0)
 		_set_dial(c, full["apex_x"], full["apex_y"])
@@ -3718,21 +4915,29 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		return cfg
 	cfg["mode"] = _ui_mode(section)
 	cfg["mirror"] = c["mirror"].pressed
+	cfg["round_ends"] = c["round_ends"]["option"].selected
+	cfg["seams"] = c["seams"]["option"].selected
 	if c["full"]:
 		cfg["ridge_offset"] = float(c["ridge_offset"]["spin"].value)
 		cfg["scale"] = float(c["scale"]["spin"].value)
 		cfg["edge"] = float(c["edge"]["spin"].value)
 		cfg["u_offset"] = float(c["u_offset"]["spin"].value)
 		cfg["merge_height"] = float(c["merge_height"]["spin"].value)
+		for vk in ["valley_line", "valley_opacity", "valley_width"]:
+			cfg[vk] = float(c[vk]["spin"].value)
 		cfg["pitch"] = float(c["pitch"]["spin"].value)
 		cfg["shade"] = float(c["shade"]["spin"].value) / 100.0
 		cfg["light"] = float(c["light"]["spin"].value)
 		cfg["taper"] = c["taper"].pressed
-		cfg["soft_seams"] = c["soft_seams"].pressed
+		cfg["repeat"] = float(c["repeat"]["spin"].value)
 		cfg["apex_on"] = c["apex_on"].pressed
 		cfg["shade_on"] = c["shade_on"].pressed
 		cfg["merge"] = c["merge"].pressed
 		cfg["side_ink"] = c["side_ink"].pressed
+		cfg["cap_outline"] = c["cap_outline"]["option"].selected
+		cfg["cap_width"] = float(c["cap_width"]["spin"].value)
+		cfg["cap_bright"] = float(c["cap_bright"]["spin"].value)
+		cfg["cap_style"] = c["cap_style"]["option"].selected
 		cfg["apex_x"] = float(c["apex_x"].value) / 100.0
 		cfg["apex_y"] = float(c["apex_y"].value) / 100.0
 		cfg["apex_lock"] = c["apex_lock"].pressed
@@ -3746,17 +4951,32 @@ func _update_visibility(section: String) -> void:
 	c["opts"].visible = c["header"].pressed
 	var mode = _ui_mode(section)
 	c["mirror"].visible = mode == MODE_FILL
+	c["round_ends"]["row"].visible = mode == MODE_FILL and c["mirror"].pressed
+	# Seams: wherever the roof has ridge / hip lines; Ridge Caps only on Hip
+	# and Gap Free with Two Slopes.
+	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and c["mirror"].pressed)
+	c["seams"]["row"].visible = mode != MODE_FILL or c["mirror"].pressed
+	c["seams"]["option"].set_item_disabled(SEAMS_CAPS, not caps_ok)
+	var caps_on = caps_ok and c["seams"]["option"].selected == SEAMS_CAPS
 	if not c["full"]:
 		return
 	var shaded = mode != MODE_FILL or c["mirror"].pressed
 	c["ridge_offset"]["row"].visible = mode == MODE_FILL and c["mirror"].pressed
-	c["soft_seams"].visible = mode != MODE_FILL or c["mirror"].pressed
 	c["taper"].visible = mode == MODE_CENTER
-	c["pitch"]["row"].visible = mode != MODE_FILL
+	c["pitch"]["row"].visible = true
 	c["u_offset"]["row"].visible = mode == MODE_FILL
-	c["merge_height"]["row"].visible = c["merge"].pressed
+	# Greyed while Merge is OFF, settings hidden.
+	c["merge_cog"].disabled = not c["merge"].pressed
+	c["merge_cog"].modulate = Color(1, 1, 1, 1) if c["merge"].pressed else Color(1, 1, 1, 0.35)
+	c["merge_box"].visible = c["merge"].pressed and c["merge_cog"].pressed
 	c["side_ink"].visible = true
+	# Seams cog: greyed except for Ridge Caps.
+	c["seams_cog"].disabled = not caps_on
+	c["seams_cog"].modulate = Color(1, 1, 1, 1) if caps_on else Color(1, 1, 1, 0.35)
+	c["cap_box"].visible = caps_on and c["seams_cog"].pressed
+	c["tex_box"].visible = c["tex_cog"].pressed
 	c["shade_on"].visible = shaded
+	c["shade_sep"].visible = shaded
 	c["global_light"].visible = shaded and c["shade_on"].pressed
 	c["merge"].visible = true
 	c["shade"]["row"].visible = shaded and c["shade_on"].pressed
@@ -3781,7 +5001,6 @@ func _on_enabled_toggled(pressed: bool, section: String) -> void:
 		return
 	if section == "tool":
 		_tool_cfg["enabled"] = pressed
-		_save_tool_cfg()
 		return
 	var store = _get_store()
 	if store == null:
@@ -3809,7 +5028,6 @@ func _on_mode_pressed(mode: int, section: String) -> void:
 		return
 	if section == "tool":
 		_tool_cfg["mode"] = mode
-		_save_tool_cfg()
 		return
 	_apply_fields(section, {"mode": mode})
 
@@ -3820,7 +5038,6 @@ func _on_toggle_changed(pressed: bool, section: String, field: String) -> void:
 		return
 	if section == "tool":
 		_tool_cfg[field] = pressed
-		_save_tool_cfg()
 		return
 	if field == "global_light":
 		_on_global_light(pressed)
@@ -4029,26 +5246,17 @@ func _update_selection(store: Dictionary) -> void:
 		var cfg = _full_cfg({})
 		cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
 		cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
+		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
+		cfg["merge"] = bool(_tool_cfg.get("merge", false))
+		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
 		_set_ui_values("select", cfg, false)
 
 
 # ── Tool settings persistence ─────────────────────────────────────────────────
 
-func _load_tool_cfg() -> void:
-	var cf = ConfigFile.new()
-	if cf.load(CONFIG_PATH) != OK:
-		return
-	_tool_cfg["enabled"] = bool(cf.get_value("tool", "enabled", false))
-	_tool_cfg["mode"] = _valid_mode(int(cf.get_value("tool", "mode", MODE_FILL)))
-	_tool_cfg["mirror"] = bool(cf.get_value("tool", "mirror", false))
-
-
-func _save_tool_cfg() -> void:
-	var dir = Directory.new()
-	if not dir.dir_exists(CONFIG_DIR):
-		dir.make_dir_recursive(CONFIG_DIR)
-	var cf = ConfigFile.new()
-	cf.set_value("tool", "enabled", bool(_tool_cfg.get("enabled", false)))
-	cf.set_value("tool", "mode", int(_tool_cfg.get("mode", MODE_FILL)))
-	cf.set_value("tool", "mirror", bool(_tool_cfg.get("mirror", false)))
-	cf.save(CONFIG_PATH)
+# Pattern Tool settings back to their defaults (every map opened).
+func _reset_tool_cfg() -> void:
+	_tool_cfg = TOOL_DEFAULTS.duplicate()
+	var cfg = _full_cfg({})
+	cfg["mode"] = int(_tool_cfg["mode"])
+	_set_ui_values("tool", cfg, false)
