@@ -20,6 +20,7 @@ The folder must contain `BetterRoofPatterns.ddmod`, `scripts/` and `icons/`.
 
 1. Select the **Pattern Tool** and pick a roof texture (tiles, slates, thatch...).
 2. Turn on **Roof Builder** in the tool panel (under the Layer control) and choose a roof type.
+   Two Slopes, Round Ends and Merge With Roof Below can be set here too.
 3. Draw your shape: it becomes a roof.
 4. Select it with the **Select Tool** to fine-tune it in the **Roof Builder** section.
 
@@ -34,6 +35,7 @@ The bottom edge of the texture (the eave) is drawn once, along the lower edge of
 
 - **Two Slopes**: an eave on both sides with a ridge in the middle (gable roof). The far slope is the near one turned 180°. The texture rotation sets the ridge direction.
 - **Ridge Offset**: shifts the tiles of the far slope so both slopes do not line up perfectly at the ridge.
+- **Round Ends** (Two Slopes): rounds one end of the ridge (**Start** or **End**, along the texture direction) or **Both**, inside the drawn shape: half a cone as wide as the roof, with the tiles laid in rings. On short roofs the round end gets flatter instead of being cut. Draw the shape along the ridge.
 
 ### Centered
 The outline of the shape becomes the eave and its centre the peak: conical towers, pyramid roofs, domes. Best on circles, ellipses and regular polygons.
@@ -50,12 +52,14 @@ Every edge is an eave and the tile rows follow the nearest edge. A rectangle get
 
 | Setting | What it does |
 |---|---|
-| **Softer Seams** | Blends ridges and hip lines over a few pixels. Off: sharp edges with an ink line and a crease shadow. |
+| **Seams** | Ridge and hip lines: **None** (plain cut), **Line** (ink line and crease shadow), **Soft** (blended over a few pixels, default) or **Ridge Caps**. Also in the Pattern Tool. |
+| **Repeat Point** | Moves where the texture repeats along the slope, when the automatic repeat shows a seam or a band. |
 | **Side Lines** | Dark outline on the sides where the texture is plainly cut (gable ends, eaves of textures without their own edge). |
+| **Ridge Caps** (Seams) / **Cap Style** / **Cap Width** / **Cap Brightness** / **Cap Outline** (None / Line / Blurred) | Covers the ridge and hip lines (Hip, Gap Free with Two Slopes) with caps made from the roof texture itself: turned tiles (half-round tiles) or a band of the texture (slates, bricks, thatch). Ridges are wider than hips; caps meet in mitred joints and follow curved ridges. Curved parts of an outline (round ends, rounded corners) get no caps. |
 | **Tile Width** | Width of the tiles. Rows keep their height, the shape keeps its size. |
 | **Edge Offset** | Moves the eave inward (+) or outward (−). Empty rows under the eave are already removed automatically. |
 | **Texture Offset** | Slides the texture sideways (Gap Free). |
-| **Pitch** | Roof steepness (Centered, Hip): steeper roofs show more tile rows. |
+| **Pitch** | Roof steepness: steeper roofs show more tile rows between the eave and the top. |
 | **Shading** | Lights one side of the roof and darkens the other. |
 | **Shading Strength** / **Light Direction** | Strength of the effect and where the light comes from (0° = top, clockwise). |
 | **Global Lighting** | One light for every roof of the map: changing strength or direction changes all roofs at once. Saved with the map. |
@@ -68,7 +72,7 @@ Every slider has a reset button. Changes apply to all selected roofs.
 
 ## Merging roofs
 
-Draw a roof over another one and turn on **Merge With Roof Below** on the top roof: where the roof below rises higher, it shows through, so both roofs meet along their real intersection line, with an ink line and a soft contact shadow.
+Draw a roof over another one and turn on **Merge With Roof Below** on the top roof: where the roof below rises higher, it shows through, so both roofs meet along their real intersection line, with an ink line and a soft valley shadow on both roofs.
 
 - Works with several roofs below and with any roof type (e.g. a conical tower on a gable roof, an L-shaped house made of two hip roofs).
 - Tip: put the roof with the most cut-out eave (round tiles, scales) on top, so its own edge is drawn over the other one.
