@@ -1,5 +1,17 @@
 ROOF BUILDER
 
+1.1.1
+NEW:
+- Added Profile for Centered roofs: Cone / Dome / Low Dome / Spire / Onion, also in the Pattern Tool + Curve slider
+ 
+CHANGED:
+- Improved shading: darker shadowed side on Centered, Hip and Gap Free Two Slopes.
+- Improved performance: faster texture analysis (kept between sessions), roof shader loaded at start.
+ 
+FIXED:
+- Fixed roofs not working on the plain colour pattern (X Pattern)
+
+
 1.1.0
 NEW:
 - Added Round Ends for Gap Free in Two Slopes mode

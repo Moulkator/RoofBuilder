@@ -46,6 +46,16 @@ const MODE_FILL = 1
 const MODE_CENTER = 2
 const MODE_HIP = 3
 # Seams (ridge / hip lines): none, ink line + shadow, soft blend, ridge caps.
+# Centered roofs: shape of the slope (cone, domes, spire, onion).
+const PROFILE_CONE = 0
+const PROFILE_DOME = 1
+const PROFILE_LOW_DOME = 2
+const PROFILE_SPIRE = 3
+const PROFILE_ONION = 4
+const PROFILE_LUT_N = 256
+# Extra rows where a curved profile is steep (1 = none).
+const PROFILE_ROW_GAMMA = 1.5
+const PROFILE_ROW_GAMMA_SPIRE = 2.5
 const SEAMS_NONE = 0
 const SEAMS_LINE = 1
 const SEAMS_SOFT = 2
@@ -57,6 +67,9 @@ const MAX_EDGES = 1024
 const CAP_SIM = 0.766        # Ridge Caps: faces turned by less (~40°) are one curved surface
 const MAX_CAP_ENDS = 32
 const ANALYSIS_COLUMNS = 128
+# Texture analyses kept between sessions (bump the version when the analysis changes).
+const TEX_CACHE_PATH = "user://better_roof_patterns_textures.json"
+const TEX_CACHE_VERSION = 1
 const UI_TOOL_NAME = "BetterRoofPatternsToolSection"
 const UI_SELECT_NAME = "BetterRoofPatternsSelectSection"
 const HEADER_ICON_PX = 24
@@ -72,10 +85,12 @@ const DEFAULT_CFG = {
 	"mirror": false,
 	"ridge_offset": 25.0,
 	"taper": true,
+	"profile": PROFILE_CONE,
+	"curve": 50.0,
 	"soft_seams": true,
 	"pitch": 0.0,
 	"shade_on": true,
-	"shade": 0.35,
+	"shade": 0.4,
 	"light": 315.0,
 	"apex_on": false,
 	"apex_x": 0.0,
@@ -181,6 +196,13 @@ uniform int cap_ends = 0;
 uniform int cap_outline = 1;
 // Cap Brightness: gamma applied to the cap texture (< 1 brighter).
 uniform float cap_gamma = 1.0;
+// Centered roofs: curved slope (Profile). profile_lut, at x = share of the
+// way up as a cone (0 eave, 1 top): r = share of the way up along the curved
+// slope, g = how much it slopes (shading, 1 = cone), b = inverse of r.
+uniform bool profile_on = false;
+// Slope length of the profile / radius: more rows where the slope is long.
+uniform float profile_len = 1.0;
+uniform sampler2D profile_lut : hint_black;
 // Seams set to None: no ink line / shadow on hard ridge and hip lines.
 uniform bool seam_lines = true;
 // Size of the ink lines and seam shadows (texels): the tile row height, or a
@@ -325,7 +347,12 @@ vec4 roof_sample(float ux, float t, float lod, vec2 size)
 float course_tiles(float kf, float t0, float d_ref, float tiles_eave)
 {
 	float t_mid = kf < 0.5 ? (t0 + row_h) * 0.5 : t0 + (kf + 0.5) * row_h;
-	float s_k = clamp(1.0 - t_mid / (pitch_scale * d_ref), 0.0, 1.0);
+	float u_k = clamp(t_mid / (pitch_scale * d_ref * (profile_on ? profile_len : 1.0)), 0.0, 1.0);
+	if (profile_on)
+	{
+		u_k = texture(profile_lut, vec2(u_k, 0.5)).b;
+	}
+	float s_k = 1.0 - u_k;
 	float n = tiles_eave * s_k;
 	// Single tiles known: always a whole number of tiles, the course loops
 	// without any seam. Otherwise (thatch...) exact count, the loop seam is
@@ -934,6 +961,15 @@ vec4 ct_edge_blur(vec4 color, vec2 v)
 // start), sx: across the cap (-1..1 on its sides), et:
 // past its end (0..1 on the rounded end, along end_dir), hw: half width.
 // Adds the cap's small shadow on the roof beside it to shadow.
+// Light factor of a face with normal n: the shadowed side gets darker than
+// the lit side gets lighter.
+float shade_light(vec2 n)
+{
+	float d = dot(n, light_dir);
+	float k = d < 0.0 ? 1.3 : 0.6;
+	return max(1.0 + shade * k * d, 0.0);
+}
+
 vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw, vec4 tint, vec2 size, float cpx, inout float shadow)
 {
 	float r = length(vec2(sx, max(et, 0.0)));
@@ -970,7 +1006,7 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 	cc *= 1.0 - 0.3 * r * r;
 	if (shade > 0.0)
 	{
-		cc *= max(1.0 + shade * 0.6 * dot(across * sx + end_dir * max(et, 0.0), light_dir), 0.0);
+		cc *= shade_light(across * sx + end_dir * max(et, 0.0));
 	}
 	float c_ink = max(ink_h * 0.03, cpx * 1.2);
 	if (cap_outline == 1)
@@ -1387,6 +1423,26 @@ void fragment()
 		{
 			t = dd <= eb ? dd : eb + (dd - eb) * (full - eb) / (rrp - eb);
 		}
+		if (profile_on && full > 0.0)
+		{
+			// Curved slope: rows closer together where it is steep (domes:
+			// near the eave), farther apart where it is flat. The eave band
+			// keeps its width.
+			float e0 = (eb > 0.0 && full > eb * 2.0) ? eb : 0.0;
+			if (t > e0)
+			{
+				float uc = clamp((t - e0) / (full - e0), 0.0, 1.0);
+				vec4 pf = texture(profile_lut, vec2(uc, 0.5));
+				t = e0 + (full * profile_len - e0) * pf.r;
+				face_n *= pf.g;
+			}
+			else
+			{
+				// Eave band: same slope as the rim, so the shading reaches
+				// the tile tips.
+				face_n *= texture(profile_lut, vec2(0.0, 0.5)).g;
+			}
+		}
 		// columns = texture repeats around the eave (outline / texture width).
 		// Counts are made in single tiles (tile_n tiles across the texture).
 		float ntile = tile_n > 0.0 ? tile_n : max(size.x / row_h, 1.0);
@@ -1725,8 +1781,8 @@ void fragment()
 	{
 		// Light of each face, blended across soft seams (the normals of two
 		// slopes can be opposite, so the light values are mixed, not them).
-		float l1 = max(1.0 + shade * 0.6 * dot(face_n, light_dir), 0.0);
-		float l2 = max(1.0 + shade * 0.6 * dot(face_n2, light_dir), 0.0);
+		float l1 = shade_light(face_n);
+		float l2 = shade_light(face_n2);
 		texel *= mix(l1, l2, w2);
 	}
 	// Ink lines only on the opaque roof: drawn over the half-transparent
@@ -2037,7 +2093,7 @@ void fragment()
 var _shader: Shader = null
 var _tex_info := {}       # texture instance id -> analysis Dictionary
 var _states := {}         # "node-id-N" -> {"mat", "sig", "lut"}
-const TOOL_DEFAULTS = {"enabled": false, "mode": MODE_FILL, "mirror": false, "round_ends": 0, "merge": false, "seams": SEAMS_SOFT}
+const TOOL_DEFAULTS = {"enabled": false, "mode": MODE_FILL, "mirror": false, "round_ends": 0, "merge": false, "seams": SEAMS_SOFT, "profile": PROFILE_CONE}
 var _tool_cfg := TOOL_DEFAULTS.duplicate()   # Pattern Tool: next shapes (reset with every map)
 var _world_ref = null
 var _pruned := false
@@ -2070,6 +2126,7 @@ func initialize() -> void:
 
 func update(_delta) -> void:
 	_api_frame = Engine.get_idle_frames()
+	_warm_shader()
 	if _g == null or _g.World == null or not is_instance_valid(_g.World):
 		_clear_captures()
 		return
@@ -2140,7 +2197,7 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["repeat", "cap_bright", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in ["curve", "repeat", "cap_bright", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
 		out[k] = float(out[k])
 	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps"]:
 		out[k] = bool(out[k])
@@ -2148,6 +2205,7 @@ func _full_cfg(cfg) -> Dictionary:
 	if not (cfg is Dictionary and cfg.has("seams")):
 		out["seams"] = SEAMS_CAPS if out["ridge_caps"] else (SEAMS_SOFT if out["soft_seams"] else SEAMS_LINE)
 	out["seams"] = int(clamp(int(out["seams"]), SEAMS_NONE, SEAMS_CAPS))
+	out["profile"] = int(clamp(int(out["profile"]), PROFILE_CONE, PROFILE_ONION))
 	out["soft_seams"] = out["seams"] >= SEAMS_SOFT
 	out["ridge_caps"] = out["seams"] == SEAMS_CAPS
 	# Cap Outline: None / Line / Blurred (older roofs: on / off).
@@ -2198,6 +2256,7 @@ func _detect_new_shapes(store: Dictionary) -> void:
 				cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
 				cfg["merge"] = bool(_tool_cfg.get("merge", false))
 				cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
+				cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
 				store["node-id-" + str(nid)] = cfg
 	elif active != "PatternShapeTool":
 		# Paste / duplicate (Select Tool), prefabs...: new pattern shapes are
@@ -2312,6 +2371,24 @@ func _sync_all(store: Dictionary) -> void:
 
 func _sync_shape(node, key: String, cfg) -> void:
 	var mat = node.material
+	if mat == null:
+		# Plain colour pattern (X, first of the list): no material at all.
+		# The roof gets a plain white texture, coloured by the shape colour.
+		var pm = ShaderMaterial.new()
+		pm.shader = _shader
+		pm.set_shader_param("albedo", _plain_tex())
+		var prot = node.get("_Rotation")
+		pm.set_shader_param("rotation", float(prot) if prot != null else 0.0)
+		pm.set_shader_param("custom_color", false)
+		var pst = _states.get(key)
+		if pst != null:
+			pst["dead"] = true
+		var nst = {"mat": pm, "sig": "", "lut": null}
+		if pst != null and pst.get("bake") != null:
+			nst["bake"] = pst["bake"]
+		_states[key] = nst
+		node.material = pm
+		mat = pm
 	if not (mat is ShaderMaterial) or mat.shader == null:
 		return
 	var st = _states.get(key)
@@ -3116,6 +3193,10 @@ func _restore_shape(node, key: String) -> void:
 	var rot = node.get("_Rotation")
 	if tex == null:
 		tex = mat.get_shader_param("albedo")
+	if tex == _plain:
+		# Plain colour pattern: back to no material.
+		node.material = null
+		return
 	if rot == null:
 		rot = mat.get_shader_param("rotation")
 	var src = mat.get_meta(CT_META) if mat.has_meta(CT_META) else null
@@ -3202,6 +3283,97 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 func _vis_offset(info: Dictionary, cfg: Dictionary) -> float:
 	var shift = info["empty"] + float(cfg.get("edge", 0.0))
 	return max(info["h"] - shift - info.get("vis_end", info["h"]), 0.0)
+
+
+var _profile_cache = {}
+var _profile_lens = {}
+
+
+# Slope length of a profile, in shape radii (see profile_len in the shader).
+func _profile_len(kind: int, curve: float) -> float:
+	_profile_tex(kind, curve)
+	return float(_profile_lens.get("%d_%d" % [kind, int(round(clamp(curve, 0.0, 100.0)))], 1.0))
+
+
+# Centered roofs, Profile: lookup table (see profile_lut in the shader).
+# Height z of the slope at radius share rho (0 top, 1 eave), top at z = h.
+# curve (0..100, 50 = default): how steep the slope gets at the eave; higher
+# = rows packed tighter there.
+func _profile_tex(kind: int, curve: float = 50.0) -> ImageTexture:
+	curve = clamp(curve, 0.0, 100.0)
+	var key = "%d_%d" % [kind, int(round(curve))]
+	if _profile_cache.has(key):
+		return _profile_cache[key]
+	# Dome: 1 - k r², k = 0.92 at 0, 0.992 at 50, 0.9992 at 100.
+	var dk = 1.0 - 0.008 * pow(10.0, (50.0 - curve) / 50.0)
+	# Spire: flare exponent 0.45 at 50 (0.15 .. 1.35).
+	var be = 0.45 * pow(3.0, (curve - 50.0) / 50.0)
+	var n = 1024
+	var rho = []
+	var z = []
+	for i in range(n + 1):
+		var r = float(i) / n
+		var zz = 0.0
+		match kind:
+			PROFILE_DOME:
+				# Not quite vertical at the eave (rows there would get too thin).
+				zz = sqrt(max(1.0 - r * r * dk, 0.0))
+			PROFILE_LOW_DOME:
+				zz = 0.5 * sqrt(max(1.0 - r * r * dk, 0.0))
+			PROFILE_ONION:
+				# Onion: round shoulder like a dome, then a concave spike
+				# up to a pointed top.
+				zz = 0.6 * sqrt(max(1.0 - r * r * r * r * dk, 0.0)) + 0.8 * pow(1.0 - r, 5.0)
+			_:
+				# Spire: steep near the eave, pointed top.
+				zz = 0.9 * pow(1.0 - r, 0.6) * pow(max(1.0 - r * r, 0.0), be)
+		rho.append(r)
+		z.append(zz)
+	# Rows along the slope from the eave (rho = 1) up. Where the slope is
+	# flat the rows keep the width they have on a stretched cone; where it
+	# is steep (rows seen squeezed) extra rows are added: each stretch of
+	# slope counts its length times its steepness^(gamma - 1).
+	var arc = []
+	arc.resize(n + 1)
+	arc[n] = 0.0
+	var length = 0.0
+	for i in range(n - 1, -1, -1):
+		var gamma = PROFILE_ROW_GAMMA
+		if kind == PROFILE_SPIRE:
+			# Spire: wide rows on the sides, many more toward the point.
+			gamma = lerp(PROFILE_ROW_GAMMA_SPIRE, 1.0, smoothstep(0.35, 0.8, rho[i]))
+		var seg = Vector2(rho[i + 1] - rho[i], z[i + 1] - z[i]).length()
+		length += seg
+		# (capped: near-vertical slopes would get rows thinner than a pixel)
+		arc[i] = arc[i + 1] + seg * pow(min(seg * n, 6.0), gamma - 1.0)
+	var total = max(arc[0], 0.000001)
+	var cone_n = sin(deg2rad(40.0))
+	var img = Image.new()
+	img.create(PROFILE_LUT_N, 1, false, Image.FORMAT_RGBAF)
+	img.lock()
+	# Inverse lookup walks the slope once (u only grows).
+	var j = 0
+	for k in range(PROFILE_LUT_N):
+		var u = float(k) / (PROFILE_LUT_N - 1)
+		# Cone share u <-> radius share 1 - u.
+		var fi = clamp((1.0 - u) * n, 0.0, n - 1.0)
+		var i0 = int(fi)
+		var a = lerp(arc[i0], arc[i0 + 1], fi - i0) / total
+		var sl = abs(z[i0 + 1] - z[i0]) * n
+		var nh = sl / sqrt(1.0 + sl * sl)
+		# Inverse: radius share where the slope length share is u.
+		while j < n and arc[n - j - 1] / total < u:
+			j += 1
+		var a0 = arc[n - j] / total
+		var a1 = arc[max(n - j - 1, 0)] / total
+		var inv = (float(j) + (clamp((u - a0) / max(a1 - a0, 0.000001), 0.0, 1.0) if j < n else 0.0)) / n
+		img.set_pixel(k, 0, Color(a, clamp(nh / cone_n, 0.0, 1.6), clamp(inv, 0.0, 1.0), 1.0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, Texture.FLAG_FILTER)
+	_profile_cache[key] = tex
+	_profile_lens[key] = total / max(length, 0.000001)
+	return tex
 
 
 # Size of ink lines and seam shadows: the tile row height, or a fixed share of
@@ -3320,7 +3492,8 @@ func _set_light(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary = {}) -> vo
 	if gl["on"]:
 		strength = gl["shade"]
 		angle = gl["light"]
-	var shade = clamp(strength, 0.0, 1.0) if bool(cfg.get("shade_on", true)) else 0.0
+	# 100 % = the shading that 75 % used to give.
+	var shade = clamp(strength, 0.0, 1.0) * 0.75 if bool(cfg.get("shade_on", true)) else 0.0
 	mat.set_shader_param("shade", shade)
 	# Light angle on the map: 0° = from the top, clockwise. light_dir points
 	# toward the light, turned into the shape's own space so moving or
@@ -3444,6 +3617,11 @@ func _update_round(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary,
 	mat.set_shader_param("row_y0", info.get("row_y0", 0.0))
 	mat.set_shader_param("tile_n", info.get("tile_n", 0.0))
 	mat.set_shader_param("taper", taper)
+	var prof = int(cfg.get("profile", PROFILE_CONE))
+	mat.set_shader_param("profile_on", prof != PROFILE_CONE)
+	if prof != PROFILE_CONE:
+		mat.set_shader_param("profile_lut", _profile_tex(prof, float(cfg.get("curve", 50.0))))
+		mat.set_shader_param("profile_len", _profile_len(prof, float(cfg.get("curve", 50.0))))
 	mat.set_shader_param("smooth_shape", data["smooth"])
 	mat.set_shader_param("star_shape", data["star"])
 	mat.set_shader_param("apex_moved", apex != null)
@@ -3885,35 +4063,127 @@ func analyze_texture(tex: Texture) -> Dictionary:
 		return _tex_info[id]
 	var w = float(tex.get_width())
 	var h = float(tex.get_height())
+	# Analyses are kept on disk between sessions (by texture file and size).
+	var dkey = ""
+	if tex.resource_path != "":
+		dkey = "%s|%dx%d" % [tex.resource_path, int(w), int(h)]
+	if dkey != "":
+		var disk = _tex_disk()
+		if disk.has(dkey) and disk[dkey] is Dictionary:
+			var cached = {}
+			for k in disk[dkey].keys():
+				cached[k] = float(disk[dkey][k])
+			_tex_info[id] = cached
+			return cached
 	var info = {"w": w, "h": h, "band_start": 0.0, "band": h, "empty": 0.0, "fade": 0.0, "row_h": h, "row_y0": 0.0, "tile_n": 0.0, "body_end": h, "vis_end": h}
 	_tex_info[id] = info
+	var ok = _analyze_into(tex, info)
+	if ok and dkey != "":
+		_tex_disk()[dkey] = info.duplicate()
+		_save_tex_disk()
+	return info
+
+
+var _tex_disk_data = null
+var _plain = null
+
+
+# Texture of the plain colour pattern (X): white, coloured by the shape.
+func _plain_tex() -> ImageTexture:
+	if _plain == null:
+		var img = Image.new()
+		img.create(256, 256, false, Image.FORMAT_RGBA8)
+		img.fill(Color(1, 1, 1, 1))
+		_plain = ImageTexture.new()
+		_plain.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
+	return _plain
+var _warm_state := 0      # 0: not done, 1..: frames since the warm-up draw, -1: done
+
+
+# The roof shader is big: the graphics driver compiles it the first time it is
+# drawn, which froze the first roof made. It is drawn once at start instead,
+# in a tiny hidden viewport.
+func _warm_shader() -> void:
+	if _warm_state < 0 or _shader == null or _g == null or not (_g.World is Node) or not is_instance_valid(_g.World) or not _g.World.is_inside_tree():
+		return
+	var holder = _bake_holder(_g.World.get_tree())
+	if _warm_state == 0:
+		var vp = Viewport.new()
+		vp.name = "Warm"
+		vp.size = Vector2(4, 4)
+		vp.transparent_bg = true
+		vp.usage = Viewport.USAGE_2D
+		vp.disable_3d = true
+		vp.gui_disable_input = true
+		vp.render_target_update_mode = Viewport.UPDATE_ONCE
+		var p = Polygon2D.new()
+		p.polygon = PoolVector2Array([Vector2(0, 0), Vector2(4, 0), Vector2(4, 4), Vector2(0, 4)])
+		var m = ShaderMaterial.new()
+		m.shader = _shader
+		p.material = m
+		vp.add_child(p)
+		holder.add_child(vp)
+	_warm_state += 1
+	if _warm_state > 3:
+		var vp = holder.get_node_or_null("Warm")
+		if vp != null:
+			vp.queue_free()
+		_warm_state = -1
+
+
+func _tex_disk() -> Dictionary:
+	if _tex_disk_data == null:
+		_tex_disk_data = {}
+		var f = File.new()
+		if f.file_exists(TEX_CACHE_PATH) and f.open(TEX_CACHE_PATH, File.READ) == OK:
+			var res = JSON.parse(f.get_as_text())
+			f.close()
+			if res.error == OK and res.result is Dictionary and int(res.result.get("version", 0)) == TEX_CACHE_VERSION and res.result.get("textures") is Dictionary:
+				_tex_disk_data = res.result["textures"]
+	return _tex_disk_data
+
+
+func _save_tex_disk() -> void:
+	var f = File.new()
+	if f.open(TEX_CACHE_PATH, File.WRITE) == OK:
+		f.store_string(JSON.print({"version": TEX_CACHE_VERSION, "textures": _tex_disk_data}))
+		f.close()
+
+
+# Returns false when the texture could not be read (nothing kept on disk).
+func _analyze_into(tex: Texture, info: Dictionary) -> bool:
+	var w = info["w"]
+	var h = info["h"]
 	var t0 = OS.get_ticks_msec()
 	var img = tex.get_data()
 	if img == null or img.is_empty():
-		return info
+		return false
 	if img.is_compressed():
 		if img.decompress() != OK:
-			return info
+			return false
 	img.convert(Image.FORMAT_RGBA8)
 	info["tile_n"] = _detect_tiles_across(img)
 	var ih = img.get_height()
 	if ih < 16:
-		return info
+		return true
 	var sc = h / float(ih)
 	img.resize(ANALYSIS_COLUMNS, ih, Image.INTERPOLATE_BILINEAR)
 	var alpha = PoolRealArray()
 	alpha.resize(ih)
 	var grid = PoolRealArray()
 	grid.resize(ih * ANALYSIS_COLUMNS)
-	img.lock()
+	# Raw RGBA8 bytes: much faster than get_pixel.
+	var px = img.get_data()
+	var k3 = 1.0 / (3.0 * 255.0 * 255.0)
+	var i = 0
 	for y in range(ih):
-		var sa = 0.0
+		var sa = 0
 		for x in range(ANALYSIS_COLUMNS):
-			var c = img.get_pixel(x, y)
-			sa += c.a
-			grid[y * ANALYSIS_COLUMNS + x] = (c.r + c.g + c.b) * c.a / 3.0
-		alpha[y] = sa / float(ANALYSIS_COLUMNS)
-	img.unlock()
+			var a = px[i + 3]
+			sa += a
+			grid[y * ANALYSIS_COLUMNS + x] = float(px[i] + px[i + 1] + px[i + 2]) * a * k3
+			i += 4
+		alpha[y] = float(sa) / (255.0 * ANALYSIS_COLUMNS)
 	# Visible edge of the eave: the lowest row that is at least half opaque
 	# (used to merge roofs on what is actually drawn).
 	var vis = ih
@@ -3935,14 +4205,14 @@ func analyze_texture(tex: Texture) -> Dictionary:
 		if body_end - body_start >= 8:
 			break
 	if body_end - body_start < 8:
-		return info
+		return true
 	var rows = _detect_rows(grid, body_start, body_end)
 	if rows[0] > 0.0:
 		info["row_h"] = rows[0] * sc
 		info["row_y0"] = rows[1] * sc
 	if body_start == 0 and body_end == ih:
 		# Fully opaque texture: plain tiling, nothing to fix.
-		return info
+		return true
 	var empty = 0
 	while empty < ih and alpha[ih - 1 - empty] < 0.02:
 		empty += 1
@@ -3959,7 +4229,7 @@ func analyze_texture(tex: Texture) -> Dictionary:
 	info["empty"] = float(empty) * sc
 	info["fade"] = float(fade) * sc
 	print("[BetterRoofPatterns] Texture analysed: %dx%d, body %d-%d, band %d, fade %d, empty %d, rows %.2f @ %.0f, %d tiles across (%d ms)" % [int(w), int(h), body_start, body_end, band, fade, empty, rows[0], rows[1], int(info["tile_n"]), OS.get_ticks_msec() - t0])
-	return info
+	return true
 
 
 # Repeat height: the band [s, s + L) is tiled, so row s + L must look like
@@ -4024,24 +4294,26 @@ func _detect_tiles_across(src: Image) -> float:
 	var ch = 16
 	img.resize(cw, ch, Image.INTERPOLATE_BILINEAR)
 	var rows = []
-	img.lock()
+	var px = img.get_data()
+	var k3 = 1.0 / (3.0 * 255.0 * 255.0)
 	for y in range(ch):
 		var line = PoolRealArray()
 		line.resize(cw)
-		var sa = 0.0
+		var sa = 0
 		var mean = 0.0
+		var i = y * cw * 4
 		for x in range(cw):
-			var c = img.get_pixel(x, y)
-			sa += c.a
-			line[x] = (c.r + c.g + c.b) * c.a / 3.0
+			var a = px[i + 3]
+			sa += a
+			line[x] = float(px[i] + px[i + 1] + px[i + 2]) * a * k3
 			mean += line[x]
-		if sa / float(cw) < 0.99:
+			i += 4
+		if float(sa) / (255.0 * cw) < 0.99:
 			continue
 		mean /= float(cw)
 		for x in range(cw):
 			line[x] -= mean
 		rows.append(line)
-	img.unlock()
 	if rows.empty():
 		return 0.0
 	var variance = 0.0
@@ -4051,17 +4323,32 @@ func _detect_tiles_across(src: Image) -> float:
 	variance /= float(rows.size() * cw)
 	if variance < 0.00000001:
 		return 0.0
+	# Circular autocorrelation at every whole lag once (lines doubled: no
+	# modulo); fractional lags are blended from the two around them.
+	var ac = PoolRealArray()
+	ac.resize(cw / 2 + 2)
+	for li in range(cw / 2 + 2):
+		ac[li] = 0.0
+	var need = {}
+	for n in range(2, 65):
+		var li = int(floor(float(cw) / float(n)))
+		need[li] = true
+		need[li + 1] = true
+	for line in rows:
+		var dbl = PoolRealArray(line)
+		dbl.append_array(line)
+		for li in need.keys():
+			var acc = 0.0
+			for x in range(cw):
+				acc += dbl[x] * dbl[x + li]
+			ac[li] += acc
 	var scores = {}
 	var best = -INF
 	for n in range(2, 65):
 		var lag = float(cw) / float(n)
 		var li = int(floor(lag))
 		var f = lag - float(li)
-		var acc = 0.0
-		for line in rows:
-			for x in range(cw):
-				var b = line[(x + li) % cw] * (1.0 - f) + line[(x + li + 1) % cw] * f
-				acc += line[x] * b
+		var acc = ac[li] * (1.0 - f) + ac[li + 1] * f
 		var sc = acc / float(rows.size() * cw) / variance
 		scores[n] = sc
 		best = max(best, sc)
@@ -4219,6 +4506,7 @@ func _build_ui() -> void:
 		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
 		cfg["merge"] = bool(_tool_cfg.get("merge", false))
 		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
+		cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
 		_set_ui_values("tool", cfg, bool(_tool_cfg.get("enabled", false)))
 	var sp = toolset.GetToolPanel("SelectTool")
 	if sp != null and sp.get("Align") != null:
@@ -4367,6 +4655,11 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 	c["seams"] = _make_option(opts, "Seams", ["None", "Line", "Soft", "Ridge Caps"],
 		"Ridge and hip lines. None: plain cut. Line: ink line and a\nsmall shadow. Soft: the two sides blended over a few pixels.\nRidge Caps: a row of cap tiles made from the roof texture\n(Hip roofs, Gap Free with Two Slopes).",
 		section, "seams")
+	c["profile"] = _make_option(opts, "Profile", ["Cone", "Dome", "Low Dome", "Spire", "Onion"],
+		"Shape of the slope: straight (cone), round (dome, low dome),\nsteep at the eave and pointed (spire), or a round shoulder\nwith a pointed top (onion dome). Rows of tiles get closer\ntogether where the roof is steep.",
+		section, "profile")
+	# Profile above Seams.
+	opts.move_child(c["profile"]["row"], c["seams"]["row"].get_index())
 	if not full:
 		c["merge"] = _make_toggle(opts, "Merge With Roof Below",
 			"The next roofs drawn join the roofs below them: where a roof\nbelow rises higher, it shows through, so the roofs meet on\ntheir real intersection line.",
@@ -4398,6 +4691,11 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
+		c["curve"] = _make_slider(opts, "Curve", 0.0, 100.0, "%",
+			"How steep the slope gets at the eave (Dome, Low Dome, Spire, Onion).\nHigher: rows of tiles packed tighter near the eave.",
+			section, "curve", icon_reset)
+		# Curve right under Profile.
+		opts.move_child(c["curve"]["row"], c["profile"]["row"].get_index() + 1)
 		c["apex_on"] = _make_toggle(opts, "Custom Top Position",
 			"Moves the roof top away from the centre of the shape.",
 			section, "apex_on")
@@ -4597,6 +4895,7 @@ func _on_option_selected(index: int, section: String, field: String) -> void:
 		return
 	if section == "tool":
 		_tool_cfg[field] = index
+		_update_visibility(section)
 		return
 	_apply_fields(section, {field: index})
 	_update_visibility(section)
@@ -4868,7 +5167,9 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 	c["round_ends"]["option"].select(full["round_ends"])
 	c["merge"].pressed = full["merge"]
 	c["seams"]["option"].select(full["seams"])
+	c["profile"]["option"].select(full["profile"])
 	if c["full"]:
+		_set_ctl(c["curve"], full["curve"])
 		_set_ctl(c["ridge_offset"], full["ridge_offset"])
 		_set_ctl(c["scale"], full["scale"])
 		_set_ctl(c["edge"], full["edge"])
@@ -4917,7 +5218,9 @@ func _read_ui_cfg(section: String) -> Dictionary:
 	cfg["mirror"] = c["mirror"].pressed
 	cfg["round_ends"] = c["round_ends"]["option"].selected
 	cfg["seams"] = c["seams"]["option"].selected
+	cfg["profile"] = c["profile"]["option"].selected
 	if c["full"]:
+		cfg["curve"] = float(c["curve"]["spin"].value)
 		cfg["ridge_offset"] = float(c["ridge_offset"]["spin"].value)
 		cfg["scale"] = float(c["scale"]["spin"].value)
 		cfg["edge"] = float(c["edge"]["spin"].value)
@@ -4957,6 +5260,9 @@ func _update_visibility(section: String) -> void:
 	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and c["mirror"].pressed)
 	c["seams"]["row"].visible = mode != MODE_FILL or c["mirror"].pressed
 	c["seams"]["option"].set_item_disabled(SEAMS_CAPS, not caps_ok)
+	c["profile"]["row"].visible = mode == MODE_CENTER
+	if c.has("curve"):
+		c["curve"]["row"].visible = mode == MODE_CENTER and c["profile"]["option"].selected != PROFILE_CONE
 	var caps_on = caps_ok and c["seams"]["option"].selected == SEAMS_CAPS
 	if not c["full"]:
 		return
@@ -5076,6 +5382,9 @@ func _on_value_changed(value: float, section: String, field: String, source: Str
 		c[field]["slider"].value = value
 	_updating_ui = false
 	var v = float(value)
+	if section == "tool":
+		_tool_cfg[field] = v
+		return
 	if field == "shade":
 		v = v / 100.0
 	if section == "select" and (field == "shade" or field == "light") and _global_light()["on"]:
@@ -5092,6 +5401,9 @@ func _on_reset_pressed(section: String, field: String) -> void:
 	_updating_ui = true
 	_set_ctl(c[field], v * 100.0 if field == "shade" else v)
 	_updating_ui = false
+	if section == "tool":
+		_tool_cfg[field] = v
+		return
 	if section == "select" and (field == "shade" or field == "light") and _global_light()["on"]:
 		_set_global_light({field: v})
 		return
@@ -5249,6 +5561,7 @@ func _update_selection(store: Dictionary) -> void:
 		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
 		cfg["merge"] = bool(_tool_cfg.get("merge", false))
 		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
+		cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
 		_set_ui_values("select", cfg, false)
 
 
