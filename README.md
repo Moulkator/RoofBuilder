@@ -41,6 +41,8 @@ The bottom edge of the texture (the eave) is drawn once, along the lower edge of
 The outline of the shape becomes the eave and its centre the peak: conical towers, pyramid roofs, domes. Best on circles, ellipses and regular polygons.
 
 - **Taper Toward Top**: each course of tiles has its own tile count, fewer and fewer toward the peak, like a real conical roof.
+- **Profile**: Cone, Dome, Low Dome, Spire or Onion. Where the slope is steep the rows are packed closer together and extra rows are added; flat parts keep wide rows, and the shading follows the curve.
+- **Curve** (Select Tool, not with Cone): how steep the slope gets at the eave. Higher packs the rows tighter there.
 - **Custom Top Position**: moves the peak away from the centre with a dial (the dots around it lock the peak on a 45° direction). The lock button sets whether the peak stays in place on the map or turns with the shape.
 
 ### Hip
