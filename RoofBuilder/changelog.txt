@@ -1,13 +1,28 @@
 ROOF BUILDER
 
+1.2.0
+NEW:
+- Added Auto Roof Library: while Roof Builder is on, the pattern list only shows roofs, including the Roof Tool's textures
+- Added Roof Pieces Cap Style: Roof Tool textures use their own ridge and hip strips as Ridge Caps
+- Added Cap Hue and Cap Saturation sliders
+- Added Link buttons next to Tile Width and Pitch: they move together so the tiles keep their shape
+- Added Copy Settings / Paste Settings buttons in the Select Tool (all settings but the texture)
+
+CHANGED:
+- Improved Cap Brightness: wider range both ways.
+- Improved Side Lines: the outline now also runs over the Ridge Caps.
+- Improved Roof Pieces: soft shadow around the strips, short fade where they meet.
+- Improved icons: smoother when shrunk.
+
+
 1.1.1
 NEW:
 - Added Profile for Centered roofs: Cone / Dome / Low Dome / Spire / Onion, also in the Pattern Tool + Curve slider
- 
+
 CHANGED:
 - Improved shading: darker shadowed side on Centered, Hip and Gap Free Two Slopes.
 - Improved performance: faster texture analysis (kept between sessions), roof shader loaded at start.
- 
+
 FIXED:
 - Fixed roofs not working on the plain colour pattern (X Pattern)
 

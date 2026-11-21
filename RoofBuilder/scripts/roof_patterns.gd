@@ -87,6 +87,7 @@ const DEFAULT_CFG = {
 	"taper": true,
 	"profile": PROFILE_CONE,
 	"curve": 50.0,
+	"size_link": false,
 	"soft_seams": true,
 	"pitch": 0.0,
 	"shade_on": true,
@@ -107,6 +108,8 @@ const DEFAULT_CFG = {
 	"cap_style": 0,
 	"cap_outline": 1,
 	"cap_bright": 0.0,
+	"cap_hue": 0.0,
+	"cap_sat": 0.0,
 	"seams": SEAMS_SOFT,
 	"repeat": 0.0,
 	"round_ends": 0,
@@ -185,8 +188,15 @@ uniform bool mirror = false;
 uniform bool ridge_caps = false;
 uniform float cap_scale = 1.0;
 // 1 = tiles (one tile column turned along the line, for half-round tiles),
-// 2 = band (one course of the texture laid along the line).
+// 2 = band (one course of the texture laid along the line), 3 = the roof's
+// own ridge / hip strips (Roof Tool assets).
 uniform int cap_style = 2;
+uniform sampler2D cap_ridge_tex;
+uniform sampler2D cap_hip_tex;
+// Rows (0..1, top / bottom) where those strips are visible: their shadow
+// is cast around that part.
+uniform vec2 cap_ridge_vis = vec2(0.0, 1.0);
+uniform vec2 cap_hip_vis = vec2(0.0, 1.0);
 // Cap width base (texels): ridges get 1.15 of it, hips 0.8.
 uniform float cap_base = 64.0;
 // Hip roofs: lines ending at the centre of a curved part of the outline
@@ -196,6 +206,9 @@ uniform int cap_ends = 0;
 uniform int cap_outline = 1;
 // Cap Brightness: gamma applied to the cap texture (< 1 brighter).
 uniform float cap_gamma = 1.0;
+// Cap Hue (turns, -0.5..0.5) and Cap Saturation (factor).
+uniform float cap_hue = 0.0;
+uniform float cap_sat = 1.0;
 // Centered roofs: curved slope (Profile). profile_lut, at x = share of the
 // way up as a cone (0 eave, 1 top): r = share of the way up along the curved
 // slope, g = how much it slopes (shading, 1 = cone), b = inverse of r.
@@ -970,13 +983,53 @@ float shade_light(vec2 n)
 	return max(1.0 + shade * k * d, 0.0);
 }
 
-vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw, vec4 tint, vec2 size, float cpx, inout float shadow)
+// Half width of a cap (ridge or hip), in local pixels.
+// Cap Brightness, Hue and Saturation.
+vec3 cap_tone(vec3 c)
+{
+	c = pow(max(c, vec3(0.0)), vec3(cap_gamma));
+	if (abs(cap_hue) > 0.0001 || abs(cap_sat - 1.0) > 0.0001)
+	{
+		vec3 hsv = ct_rgb2hsv(c);
+		hsv.x = fract(hsv.x + cap_hue);
+		hsv.y = clamp(hsv.y * cap_sat, 0.0, 1.0);
+		c = ct_hsv2rgb(hsv);
+	}
+	return c;
+}
+
+float cap_hw(bool is_ridge, float cosn)
+{
+	if (cap_style == 3)
+	{
+		// Roof Tool strips: as wide as they are tall (as DD draws them).
+		vec2 ps = vec2(is_ridge ? textureSize(cap_ridge_tex, 0) : textureSize(cap_hip_tex, 0));
+		return max(ps.y, 2.0) * 0.5 * cap_scale;
+	}
+	return cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * cap_scale * 0.5;
+}
+
+vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw, vec4 tint, vec2 size, float cpx, inout float shadow, bool is_ridge)
 {
 	float r = length(vec2(sx, max(et, 0.0)));
+	if (cap_style == 3 && cap_outline != 2)
+	{
+		// Roof Tool strip: shadow around its visible part.
+		vec2 vis = is_ridge ? cap_ridge_vis : cap_hip_vis;
+		float vh = max((vis.y - vis.x) * 0.5, 0.02);
+		float vv = ((0.5 + 0.5 * sx) - (vis.x + vis.y) * 0.5) / vh;
+		float rv = length(vec2(vv, max(et, 0.0) * 0.5 / vh));
+		if (rv > 1.0)
+		{
+			float spread = max(vh * 2.0 * hw, cpx * 4.0);
+			shadow = max(shadow, 1.0 - clamp((rv - 1.0) * vh * 2.0 * hw / spread, 0.0, 1.0));
+		}
+	}
 	if (r > 1.0)
 	{
-		// Small shadow beside the cap (none when it fades out: Blurred).
-		if (cap_outline != 2)
+		// Small shadow beside the cap (none when it fades out: Blurred, and
+		// none for Roof Tool strips: they get one from their own shape).
+		if (cap_outline != 2 && cap_style != 3)
 		{
 			shadow = max(shadow, 1.0 - clamp((r - 1.0) / 0.6, 0.0, 1.0));
 		}
@@ -984,6 +1037,40 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 	}
 	vec2 cuv;
 	float k_len;
+	if (cap_style == 3)
+	{
+		// The roof's own ridge / hip strip, laid along the line.
+		vec2 ps = vec2(is_ridge ? textureSize(cap_ridge_tex, 0) : textureSize(cap_hip_tex, 0));
+		float k = ps.y / (2.0 * hw);
+		vec2 puv = vec2(a * k / ps.x, 0.5 + 0.5 * sx);
+		float lod = max(log2(cpx * k), 0.0);
+		vec4 pc;
+		if (is_ridge)
+		{
+			pc = textureLod(cap_ridge_tex, puv, lod);
+		}
+		else
+		{
+			pc = textureLod(cap_hip_tex, puv, lod);
+		}
+		vec3 pcc = ct_on ? ct_colour(pc).rgb : pc.rgb * tint.rgb;
+		pcc = cap_tone(pcc);
+		if (shade > 0.0)
+		{
+			pcc *= shade_light(across * sx * 0.5 + end_dir * max(et, 0.0));
+		}
+		float p_ink = max(ink_h * 0.03, cpx * 1.2);
+		if (cap_outline == 1)
+		{
+			pcc *= mix(1.0, 0.15, 1.0 - smoothstep(p_ink * 0.5, p_ink, (1.0 - r) * hw));
+		}
+		float pk = clamp((1.0 - r) * hw / cpx + 0.5, 0.0, 1.0) * pc.a;
+		if (cap_outline == 2)
+		{
+			pk *= smoothstep(0.0, 0.55, 1.0 - r);
+		}
+		return vec4(pcc, pk);
+	}
 	if (cap_style == 1)
 	{
 		// One tile column turned along the line, fitted to the width.
@@ -1001,7 +1088,7 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 	}
 	vec4 cap = textureLod(albedo, vec2(cuv.x, cuv.y / size.y), max(log2(cpx / k_len), 0.0));
 	vec3 cc = ct_on ? ct_colour(cap).rgb : cap.rgb * tint.rgb;
-	cc = pow(max(cc, vec3(0.0)), vec3(cap_gamma));
+	cc = cap_tone(cc);
 	// Rounded: darker toward its sides and end, lit across.
 	cc *= 1.0 - 0.3 * r * r;
 	if (shade > 0.0)
@@ -1179,7 +1266,7 @@ vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec
 		return vec4(0.0);
 	}
 	float cosn = dot(fi.xy, fj.xy);
-	float hw = cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * cap_scale * 0.5;
+	float hw = cap_hw(cosn < -0.7, cosn);
 	float dd = dot(ej.xy - v, fj.xy) - dot(ei.xy - v, fi.xy);
 	float s = dd / sqrt(l2);
 	if (abs(s) > hw * 1.7)
@@ -1216,7 +1303,7 @@ vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec
 	float et = end_on ? dot(q - end_p, end_dir) / hw : 0.0;
 	float sx = o * s / hw;
 	r = length(vec2(sx, max(et, 0.0)));
-	return cap_piece(a, sx, et, across, end_dir, hw, tint, size, cpx, shadow);
+	return cap_piece(a, sx, et, across, end_dir, hw, tint, size, cpx, shadow, cosn < -0.7);
 }
 
 // Ridge Caps: is the line between faces a and b (b at distance db) only the
@@ -1882,7 +1969,7 @@ void fragment()
 		vec4 cap_2 = vec4(0.0);
 		float r_1 = 100.0;
 		float r_2 = 100.0;
-		float hw_max = cap_base * 1.15 * cap_scale * 0.5;
+		float hw_max = max(cap_hw(true, -1.0), cap_hw(false, 0.0));
 		if (roof_mode == 3)
 		{
 			// The lines bounding this pixel's face: with the nearest face
@@ -1982,7 +2069,7 @@ void fragment()
 		{
 			// Gap Free, Two Slopes: one ridge along the shape, ending rounded
 			// at the centre of each round end.
-			float hw = hw_max;
+			float hw = cap_hw(true, -1.0);
 			vec2 gr = vec2(-sin(rotation) / size.x, cos(rotation) / size.y);
 			vec2 gn = normalize(gr);
 			vec2 along = vec2(-gn.y, gn.x);
@@ -2014,14 +2101,47 @@ void fragment()
 					}
 				}
 			}
-			vec4 ck = cap_piece(dot(v_local, along), sx, et, gn, end_dir, hw, COLOR, size, cpx, cap_sh);
+			vec4 ck = cap_piece(dot(v_local, along), sx, et, gn, end_dir, hw, COLOR, size, cpx, cap_sh, true);
 			cap_keep(ck, length(vec2(sx, max(et, 0.0))), cap_1, r_1, cap_2, r_2);
 		}
-		texel *= 1.0 - 0.35 * cap_sh * cap_sh * ink_a;
-		// Where two caps meet (mitred), blend them over about a pixel.
-		float cw = cap_2.a > 0.0 ? clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0) : 1.0;
-		vec4 cap_c = mix(cap_2, cap_1, cw);
-		texel = mix(texel, cap_c.rgb, cap_c.a);
+		texel *= 1.0 - (cap_style == 3 ? 0.5 : 0.35) * cap_sh * cap_sh * ink_a;
+		if (cap_style == 3)
+		{
+			// Roof Tool strips (partly transparent): laid one over the
+			// other, the nearest on top, cross-faded around the line where
+			// they meet.
+			float a1 = cap_1.a;
+			if (cap_2.a > 0.0)
+			{
+				// Only where the other strip is there to show through.
+				float wx = 0.5 + 0.5 * smoothstep(0.0, 0.2, r_2 - r_1);
+				a1 *= 1.0 - (1.0 - wx) * cap_2.a;
+			}
+			texel = mix(texel, cap_2.rgb, cap_2.a);
+			texel = mix(texel, cap_1.rgb, a1);
+		}
+		else
+		{
+			// Where two caps meet (mitred), blend them over about a pixel.
+			float cw = cap_2.a > 0.0 ? clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0) : 1.0;
+			vec4 cap_c = mix(cap_2, cap_1, cw);
+			texel = mix(texel, cap_c.rgb, cap_c.a);
+		}
+		// Side Lines: the caps are cut by the outline too, ink line there.
+		float cap_a = max(cap_1.a, cap_2.a);
+		if (side_ink && cap_a > 0.0 && edge_count > 0)
+		{
+			float c_ink = max(ink_h * 0.04, cpx * 1.5);
+			float de_min = 1000000.0;
+			for (int i = 0; i < edge_count; i++)
+			{
+				vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+				vec2 ab = e.zw - e.xy;
+				float h = clamp(dot(v_local - e.xy, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
+				de_min = min(de_min, length(v_local - e.xy - ab * h));
+			}
+			texel *= mix(1.0, 0.12, (1.0 - smoothstep(c_ink * 0.5, c_ink, de_min)) * cap_a * ink_a);
+		}
 	}
 	float keep = round_keep;
 	if (merge_on)
@@ -2118,6 +2238,7 @@ func initialize() -> void:
 		if stale != null:
 			stale.name = BAKE_HOLDER + "Old"
 			stale.queue_free()
+	_lib_load_settings()
 	_build_ui()
 	# Other mods find this instance here (weak: a mods reload frees it).
 	Engine.set_meta(API_META, weakref(self))
@@ -2127,6 +2248,9 @@ func initialize() -> void:
 func update(_delta) -> void:
 	_api_frame = Engine.get_idle_frames()
 	_warm_shader()
+	if (_lib_on or _lib_dirty) and _api_frame % 10 == 0:
+		_lib_sync()
+		_lib_dirty = false
 	if _g == null or _g.World == null or not is_instance_valid(_g.World):
 		_clear_captures()
 		return
@@ -2197,9 +2321,9 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["curve", "repeat", "cap_bright", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in ["curve", "repeat", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
 		out[k] = float(out[k])
-	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps"]:
+	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps", "size_link"]:
 		out[k] = bool(out[k])
 	# Seams: older roofs only have Softer Seams / Ridge Caps.
 	if not (cfg is Dictionary and cfg.has("seams")):
@@ -2214,7 +2338,7 @@ func _full_cfg(cfg) -> Dictionary:
 	out.erase("cap_ink")
 	out["cap_outline"] = int(clamp(int(out["cap_outline"]), 0, 2))
 	out["round_ends"] = int(clamp(int(out["round_ends"]), 0, 3))
-	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, 2))
+	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, 3))
 	return out
 
 
@@ -2452,6 +2576,11 @@ func _sync_shape(node, key: String, cfg) -> void:
 		return
 	if st.get("ck") != ck:
 		_map_rev += 1
+	# Cap Style Roof Pieces on a texture without them (pasted settings,
+	# texture changed...): back to Auto.
+	if cfg is Dictionary and int(cfg.get("cap_style", 0)) == 3 and not _has_pieces(mat.get_shader_param("albedo")):
+		cfg["cap_style"] = 0
+		ck = _cheap_key(node, mat, cfg)
 	st["ck"] = ck
 	st["rev"] = _map_rev
 	var full = _full_cfg(cfg)
@@ -3239,7 +3368,11 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	mat.set_shader_param("ridge_caps", seams == SEAMS_CAPS)
 	mat.set_shader_param("cap_outline", int(cfg.get("cap_outline", 1)))
 	# Cap Brightness -100..100 %: gamma 2 .. 0.5.
-	mat.set_shader_param("cap_gamma", pow(2.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0))
+	# Cap Brightness -100..100 %: gamma 4 .. 0.25.
+	mat.set_shader_param("cap_gamma", pow(4.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0))
+	mat.set_shader_param("cap_hue", clamp(float(cfg.get("cap_hue", 0.0)), -180.0, 180.0) / 360.0)
+	# Cap Saturation -100..100 %: grey .. twice as saturated.
+	mat.set_shader_param("cap_sat", 1.0 + clamp(float(cfg.get("cap_sat", 0.0)), -100.0, 100.0) / 100.0)
 	mat.set_shader_param("cap_scale", clamp(float(cfg.get("cap_width", 100.0)), 10.0, 500.0) / 100.0)
 	# Cap width from the tile rows (textures without rows: a quarter of the
 	# texture height at most).
@@ -3249,6 +3382,17 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 		crh = min(info["h"] * 0.25, 80.0)
 	var tn = float(info.get("tile_n", 0.0))
 	var cstyle = int(cfg.get("cap_style", 0))
+	var pieces = _roof_pieces(mat.get_shader_param("albedo"))
+	var has_pieces = pieces.has("ridge") and pieces.has("hip")
+	if cstyle == 3 and not has_pieces:
+		cstyle = 0
+	if cstyle == 0 and has_pieces:
+		cstyle = 3
+	if cstyle == 3:
+		mat.set_shader_param("cap_ridge_tex", pieces["ridge"])
+		mat.set_shader_param("cap_hip_tex", pieces["hip"])
+		mat.set_shader_param("cap_ridge_vis", _strip_vis(pieces["ridge"]))
+		mat.set_shader_param("cap_hip_vis", _strip_vis(pieces["hip"]))
 	if cstyle == 0:
 		# Auto: narrow single tiles (half-round tiles...) are turned along the
 		# line, anything else (slates, bricks, thatch...) laid as a band.
@@ -3256,7 +3400,10 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	mat.set_shader_param("cap_style", cstyle)
 	mat.set_shader_param("ink_h", _ink_h(info))
 	# Cap width base: one tile (turned tiles) or one course (band).
-	mat.set_shader_param("cap_base", min(info["w"] / tn if cstyle == 1 and tn > 0.0 else crh, 128.0))
+	var cbase = min(info["w"] / tn if cstyle == 1 and tn > 0.0 else crh, 128.0)
+	if cstyle == 3:
+		cbase = float(pieces["ridge"].get_height())
+	mat.set_shader_param("cap_base", cbase)
 	# The texture draws its own eave edge (transparent rows under the tiles).
 	mat.set_shader_param("eave_cut", info.get("body_end", info["h"]) < info["h"] - 0.5)
 	mat.set_shader_param("row_h", info.get("row_h", info["h"]))
@@ -4522,10 +4669,19 @@ func _load_icon(file_name: String, max_px: int) -> Texture:
 	if img.load(_g.Root + "icons/" + file_name) != OK:
 		print("[BetterRoofPatterns] icon not found: icons/" + file_name)
 		return null
+	img.convert(Image.FORMAT_RGBA8)
+	# Colour bled into the transparent pixels: no dark fringe once shrunk.
+	img.fix_alpha_edges()
 	var big = max(img.get_width(), img.get_height())
 	if big > max_px:
+		# Halved step by step (each pixel averaged from its 4), then the
+		# last step with Lanczos: sharp, without the aliasing of one big
+		# cubic step.
+		while big > max_px * 2:
+			img.resize(max(1, img.get_width() / 2), max(1, img.get_height() / 2), Image.INTERPOLATE_BILINEAR)
+			big = max(img.get_width(), img.get_height())
 		var k = float(max_px) / float(big)
-		img.resize(int(max(1, round(img.get_width() * k))), int(max(1, round(img.get_height() * k))), Image.INTERPOLATE_CUBIC)
+		img.resize(int(max(1, round(img.get_width() * k))), int(max(1, round(img.get_height() * k))), Image.INTERPOLATE_LANCZOS)
 	var tex = ImageTexture.new()
 	tex.create_from_image(img, Texture.FLAG_FILTER)
 	return tex
@@ -4629,13 +4785,41 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		header.hint_tooltip = "Turns the selected pattern shapes into roofs (ON)\nor back into plain patterns (OFF)."
 	header.connect("toggled", self, "_on_enabled_toggled", [section])
 	root.add_child(header)
+	var clip_row = null
+	if full:
+		# Copy / paste every roof setting (not the texture) between roofs.
+		clip_row = HBoxContainer.new()
+		var cb = Button.new()
+		cb.text = "Copy Settings"
+		cb.focus_mode = Control.FOCUS_NONE
+		cb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		cb.hint_tooltip = "Copies the roof settings of the selected roof (all but the texture)."
+		cb.connect("pressed", self, "_on_settings_copy")
+		_style_mode_button(cb)
+		clip_row.add_child(cb)
+		var pb = Button.new()
+		pb.text = "Paste Settings"
+		pb.focus_mode = Control.FOCUS_NONE
+		pb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		pb.hint_tooltip = "Gives the copied roof settings to the selected shapes (they\nbecome roofs if they were not). Their texture is kept."
+		pb.disabled = _settings_clip == null
+		pb.connect("pressed", self, "_on_settings_paste")
+		_style_mode_button(pb)
+		clip_row.add_child(pb)
 
 	var opts = VBoxContainer.new()
 	root.add_child(opts)
+	var lib = CheckButton.new()
+	lib.text = "Auto Roof Library"
+	lib.focus_mode = Control.FOCUS_NONE
+	lib.hint_tooltip = "While Roof Builder is on, the pattern list only shows roof\ntextures: the patterns that are roofs, then the roof textures\nof DD's Roof Tool. Kept for every map."
+	lib.pressed = _lib_on
+	lib.connect("toggled", self, "_on_lib_toggled")
+	opts.add_child(lib)
 	var mode_row = HBoxContainer.new()
 	opts.add_child(mode_row)
 	var group = ButtonGroup.new()
-	var c = {"root": root, "header": header, "opts": opts, "full": full, "modes": {}}
+	var c = {"root": root, "header": header, "opts": opts, "full": full, "modes": {}, "lib": lib, "clip": clip_row}
 	c["modes"][MODE_FILL] = _make_mode_button(mode_row, group, "Gap Free",
 		"The texture's bottom edge (eave) is drawn once, on the lower\nedge of the shape, and only the repeatable part is tiled above\nit, so large roofs no longer show holes.",
 		MODE_FILL, section)
@@ -4668,8 +4852,8 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["side_ink"] = _make_toggle(opts, "Side Lines",
 			"Draws a dark outline on every side where the texture is plainly\ncut, whatever the drawn shape: eaves when the texture has no\ncut-out edge of its own, and always the sides that are not an\neave (gable ends, the sides a moved roof top is close to).",
 			section, "side_ink")
-		c["cap_style"] = _make_option(opts, "Cap Style", ["Auto", "Turned Tiles", "Texture Band"],
-			"Turned Tiles: one tile column of the texture turned along the\nline (half-round tiles). Texture Band: one course of the texture\nlaid along the line (slates, bricks, thatch...). Auto picks from\nthe texture.",
+		c["cap_style"] = _make_option(opts, "Cap Style", ["Auto", "Turned Tiles", "Texture Band", "Roof Pieces"],
+			"Turned Tiles: one tile column of the texture turned along the\nline (half-round tiles). Texture Band: one course of the texture\nlaid along the line (slates, bricks, thatch...). Roof Pieces: the\nridge and hip strips of a Roof Tool texture. Auto picks from the\ntexture (Roof Pieces when it has them).",
 			section, "cap_style")
 		c["cap_width"] = _make_slider(opts, "Cap Width", 30.0, 300.0, "%",
 			"Width of the ridge caps (ridges are always wider than hips).",
@@ -4677,6 +4861,12 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["cap_bright"] = _make_slider(opts, "Cap Brightness", -100.0, 100.0, "%",
 			"Brightness of the ridge caps (changes their gamma: darker\nor lighter than the roof).",
 			section, "cap_bright", icon_reset)
+		c["cap_hue"] = _make_slider(opts, "Cap Hue", -180.0, 180.0, "°",
+			"Turns the colour of the ridge caps around the colour wheel.",
+			section, "cap_hue", icon_reset)
+		c["cap_sat"] = _make_slider(opts, "Cap Saturation", -100.0, 100.0, "%",
+			"Colour strength of the ridge caps: -100% grey, +100% twice\nas strong.",
+			section, "cap_sat", icon_reset)
 		c["cap_outline"] = _make_option(opts, "Cap Outline", ["None", "Line", "Blurred"],
 			"Edge of the ridge caps: plain, a black ink line, or blurred\n(the cap fades out toward its sides).",
 			section, "cap_outline")
@@ -4687,7 +4877,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["seams"]["row"].add_child(c["seams_cog"])
 		c["seams"]["row"].move_child(c["seams_cog"], 1)
 		c["cap_box"] = _make_box(opts, c["seams"]["row"].get_index() + 1,
-			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_bright"]["row"], c["cap_outline"]["row"], c["cap_sep"]])
+			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_outline"]["row"], c["cap_sep"]])
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
@@ -4756,6 +4946,23 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["pitch"] = _make_slider(opts, "Pitch", 0.0, 70.0, "°",
 			"Roof steepness: steeper roofs show more tile rows\nbetween the edge and the top.",
 			section, "pitch", icon_reset)
+		# Link: Tile Width and Pitch move together (the tiles keep their
+		# shape: steeper rows are seen shorter, the tiles get as narrow).
+		var icon_link = _load_icon("link.png", RESET_ICON_PX)
+		c["links"] = []
+		for f in ["scale", "pitch"]:
+			var lb = Button.new()
+			lb.toggle_mode = true
+			lb.flat = true
+			lb.focus_mode = Control.FOCUS_NONE
+			lb.hint_tooltip = "Links Tile Width and Pitch: they move together so the tiles keep\ntheir shape (a steeper roof shows shorter rows and narrower tiles)."
+			if icon_link != null:
+				lb.icon = icon_link
+			else:
+				lb.text = "Link"
+			lb.connect("toggled", self, "_on_link_toggled", [section])
+			c[f]["row"].get_child(1).add_child(lb)
+			c["links"].append(lb)
 		c["shade_sep"] = HSeparator.new()
 		opts.add_child(c["shade_sep"])
 		opts.move_child(c["shade_sep"], c["pitch"]["row"].get_index() + 1)
@@ -4781,6 +4988,11 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		trow.add_child(c["tex_cog"])
 		c["tex_box"] = _make_box(opts, trow.get_index() + 1,
 			[c["scale"]["row"], c["ridge_offset"]["row"], c["repeat"]["row"], c["edge"]["row"], c["u_offset"]["row"], c["pitch"]["row"]])
+	if clip_row != null:
+		# At the bottom of the section, under a divider (the panel already
+		# has one below the section).
+		root.add_child(HSeparator.new())
+		root.add_child(clip_row)
 	return c
 
 
@@ -5178,6 +5390,9 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		for vk in ["valley_line", "valley_opacity", "valley_width"]:
 			_set_ctl(c[vk], full[vk])
 		_set_ctl(c["pitch"], full["pitch"])
+		for lb in c["links"]:
+			lb.pressed = full["size_link"]
+		_link_take(section)
 		var gl = _global_light()
 		c["global_light"].pressed = gl["on"]
 		_set_ctl(c["shade"], (gl["shade"] if gl["on"] else full["shade"]) * 100.0)
@@ -5190,6 +5405,8 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		c["cap_outline"]["option"].select(full["cap_outline"])
 		_set_ctl(c["cap_width"], full["cap_width"])
 		_set_ctl(c["cap_bright"], full["cap_bright"])
+		_set_ctl(c["cap_hue"], full["cap_hue"])
+		_set_ctl(c["cap_sat"], full["cap_sat"])
 		c["cap_style"]["option"].select(full["cap_style"])
 		c["apex_x"].value = round(full["apex_x"] * 100.0)
 		c["apex_y"].value = round(full["apex_y"] * 100.0)
@@ -5229,6 +5446,7 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		for vk in ["valley_line", "valley_opacity", "valley_width"]:
 			cfg[vk] = float(c[vk]["spin"].value)
 		cfg["pitch"] = float(c["pitch"]["spin"].value)
+		cfg["size_link"] = c["links"][0].pressed
 		cfg["shade"] = float(c["shade"]["spin"].value) / 100.0
 		cfg["light"] = float(c["light"]["spin"].value)
 		cfg["taper"] = c["taper"].pressed
@@ -5240,6 +5458,8 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		cfg["cap_outline"] = c["cap_outline"]["option"].selected
 		cfg["cap_width"] = float(c["cap_width"]["spin"].value)
 		cfg["cap_bright"] = float(c["cap_bright"]["spin"].value)
+		cfg["cap_hue"] = float(c["cap_hue"]["spin"].value)
+		cfg["cap_sat"] = float(c["cap_sat"]["spin"].value)
 		cfg["cap_style"] = c["cap_style"]["option"].selected
 		cfg["apex_x"] = float(c["apex_x"].value) / 100.0
 		cfg["apex_y"] = float(c["apex_y"].value) / 100.0
@@ -5252,6 +5472,8 @@ func _update_visibility(section: String) -> void:
 	if c == null or not is_instance_valid(c["root"]):
 		return
 	c["opts"].visible = c["header"].pressed
+	if c.get("clip") != null:
+		c["clip"].get_child(0).disabled = not c["header"].pressed
 	var mode = _ui_mode(section)
 	c["mirror"].visible = mode == MODE_FILL
 	c["round_ends"]["row"].visible = mode == MODE_FILL and c["mirror"].pressed
@@ -5260,6 +5482,19 @@ func _update_visibility(section: String) -> void:
 	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and c["mirror"].pressed)
 	c["seams"]["row"].visible = mode != MODE_FILL or c["mirror"].pressed
 	c["seams"]["option"].set_item_disabled(SEAMS_CAPS, not caps_ok)
+	if c.has("cap_style") and section == "select":
+		# Roof Pieces only for textures that have them (all the selection).
+		var pieces_ok = not _sel_shapes.empty()
+		for sh in _sel_shapes:
+			if _is_pattern_shape(sh) and not (sh.material is ShaderMaterial and _has_pieces(sh.material.get_shader_param("albedo"))):
+				pieces_ok = false
+				break
+		var cso = c["cap_style"]["option"]
+		cso.set_item_disabled(3, not pieces_ok)
+		if not pieces_ok and cso.selected == 3:
+			cso.select(0)
+			if not _updating_ui:
+				_apply_fields(section, {"cap_style": 0})
 	c["profile"]["row"].visible = mode == MODE_CENTER
 	if c.has("curve"):
 		c["curve"]["row"].visible = mode == MODE_CENTER and c["profile"]["option"].selected != PROFILE_CONE
@@ -5390,7 +5625,47 @@ func _on_value_changed(value: float, section: String, field: String, source: Str
 	if section == "select" and (field == "shade" or field == "light") and _global_light()["on"]:
 		_set_global_light({field: v})
 		return
-	_apply_fields(section, {field: v})
+	_apply_fields(section, _linked(section, field, v))
+
+
+# Tile Width and Pitch linked: width = k * cos(pitch), k taken when linked.
+func _linked(section: String, field: String, v: float) -> Dictionary:
+	var out = {field: v}
+	var c = _ui.get(section)
+	if c == null or not c.has("links") or not c["links"][0].pressed or not (field == "scale" or field == "pitch"):
+		return out
+	_updating_ui = true
+	if field == "scale":
+		var p = rad2deg(acos(clamp(v / max(_link_k, 0.001), 0.0, 1.0)))
+		p = clamp(p, 0.0, 70.0)
+		out["pitch"] = p
+		_set_ctl(c["pitch"], p)
+	else:
+		var w = clamp(_link_k * cos(deg2rad(v)), 10.0, 400.0)
+		out["scale"] = w
+		_set_ctl(c["scale"], w)
+	_updating_ui = false
+	return out
+
+
+func _link_take(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null or not c.has("scale"):
+		return
+	_link_k = float(c["scale"]["spin"].value) / max(cos(deg2rad(float(c["pitch"]["spin"].value))), 0.05)
+
+
+func _on_link_toggled(pressed: bool, section: String) -> void:
+	var c = _ui.get(section)
+	if c == null:
+		return
+	if not _updating_ui:
+		_updating_ui = true
+		for lb in c["links"]:
+			lb.pressed = pressed
+		_updating_ui = false
+		_link_take(section)
+		_apply_fields(section, {"size_link": pressed})
 
 
 func _on_reset_pressed(section: String, field: String) -> void:
@@ -5407,7 +5682,7 @@ func _on_reset_pressed(section: String, field: String) -> void:
 	if section == "select" and (field == "shade" or field == "light") and _global_light()["on"]:
 		_set_global_light({field: v})
 		return
-	_apply_fields(section, {field: v})
+	_apply_fields(section, _linked(section, field, v))
 
 
 func _on_apex_spin(_value, section: String) -> void:
@@ -5538,6 +5813,18 @@ func _update_selection(store: Dictionary) -> void:
 	var show = shapes.size() > 0
 	if c["root"].visible != show:
 		c["root"].visible = show
+	# Texture changed on the selection (same shapes): Cap Style's Roof
+	# Pieces follows it.
+	var tsig = ""
+	for sh in shapes:
+		var m = sh.material
+		var t = m.get_shader_param("albedo") if m is ShaderMaterial else null
+		tsig += str(t.get_instance_id() if t != null else 0) + ","
+	if tsig != _sel_tex_sig:
+		_sel_tex_sig = tsig
+		if sig == _sel_sig and c["header"].pressed:
+			_sel_shapes = shapes
+			_update_visibility("select")
 	if sig == _sel_sig:
 		return
 	_sel_sig = sig
@@ -5573,3 +5860,712 @@ func _reset_tool_cfg() -> void:
 	var cfg = _full_cfg({})
 	cfg["mode"] = int(_tool_cfg["mode"])
 	_set_ui_values("tool", cfg, false)
+
+
+# ── Roof Tool textures (pattern lists and roof pieces) ──────────────────────
+#
+# Asset packs can give their roofs to DD's Roof Tool instead of (or as well as)
+# the Pattern Tool: textures/roofs/<name>/tiles.* with edge / ridge / hip
+# strips beside it. "Auto Roof Library" adds those tiles textures to
+# the pattern lists (minus the ones also given as patterns: same file), and a
+# roof whose texture is one of them gets the ridge and hip strips as its
+# Ridge Caps.
+
+const ROOF_IMG_EXTS = ["png", "webp", "jpg", "jpeg"]
+
+var _lib_built = false
+var _lib_by_md5 = {}          # tiles file md5 -> tiles path (every Roof Tool texture)
+var _lib_lens = {}            # their file sizes
+var _lib_by_name = {}         # roof folder name (see _name_key) -> tiles path
+var _pieces_cache = {}        # texture path -> {ridge, hip, edge} (textures or null)
+
+
+var _asset_script = null
+
+
+# Asset list of a category through DD's Script API (null outside DD).
+func _asset_list(category: String):
+	if _asset_script == null:
+		_asset_script = GDScript.new()
+		_asset_script.source_code = "static func get_list(c):\n\treturn Script.GetAssetList(c)\n"
+		if _asset_script.reload() != OK:
+			_asset_script = false
+	if not (_asset_script is GDScript):
+		return null
+	return _asset_script.get_list(category)
+
+
+func _file_exts_in(dir_path: String) -> Dictionary:
+	# file name (without .import) -> full path, for one folder.
+	var out = {}
+	var d = Directory.new()
+	if d.open(dir_path) != OK:
+		return out
+	d.list_dir_begin(true, true)
+	var f = d.get_next()
+	while f != "":
+		if not d.current_is_dir():
+			var name = f.trim_suffix(".import")
+			out[name] = dir_path.plus_file(name)
+		f = d.get_next()
+	d.list_dir_end()
+	return out
+
+
+func _sub_dirs(dir_path: String) -> Array:
+	var out = []
+	var d = Directory.new()
+	if d.open(dir_path) != OK:
+		return out
+	d.list_dir_begin(true, true)
+	var f = d.get_next()
+	while f != "":
+		if d.current_is_dir():
+			out.append(dir_path.plus_file(f))
+		f = d.get_next()
+	d.list_dir_end()
+	return out
+
+
+# tiles.* path of a roof folder (or the path itself when it is the tiles file).
+func _tiles_path(p: String) -> String:
+	if p.get_extension().to_lower() in ROOF_IMG_EXTS:
+		return p
+	var files = _file_exts_in(p)
+	for e in ROOF_IMG_EXTS:
+		if files.has("tiles." + e):
+			return files["tiles." + e]
+	return ""
+
+
+func _roof_tiles_paths() -> Array:
+	var out = []
+	# The Roof Tool's own list first (only the packs in use).
+	var rg = _grid_menu("RoofTool", false)
+	if rg != null and rg.get_item_count() > 0:
+		for i in range(rg.get_item_count()):
+			var m = rg.get_item_metadata(i)
+			if m is String and m != "":
+				var t0 = _tiles_path(m)
+				if t0 != "" and not t0 in out:
+					out.append(t0)
+		return out
+	var lst = _asset_list("Roofs")
+	if lst != null:
+		for p in lst:
+			var t = _tiles_path(str(p))
+			if t != "" and not t in out:
+				out.append(t)
+		return out
+	# Outside DD (or an older DD): look through the folders.
+	var roots = ["res://textures/roofs"]
+	for pk in _sub_dirs("res://packs"):
+		roots.append(pk.plus_file("textures/roofs"))
+	for r in roots:
+		for rd in _sub_dirs(r):
+			var t = _tiles_path(rd)
+			if t != "":
+				out.append(t)
+	return out
+
+
+var _len_cache = {}
+
+
+func _file_len(path: String) -> int:
+	if _len_cache.has(path):
+		return _len_cache[path]
+	var n = -1
+	var f = File.new()
+	if f.open(path, File.READ) == OK:
+		n = f.get_len()
+		f.close()
+	_len_cache[path] = n
+	return n
+
+
+# Roof Tool textures by file content (md5 -> tiles path), to find the roof
+# pieces of a texture also given as a pattern.
+func _lib_build() -> void:
+	if _lib_built:
+		return
+	var tiles = _roof_tiles_paths()
+	if tiles.empty():
+		return
+	_lib_built = true
+	_lib_by_md5 = {}
+	_lib_lens = {}
+	_lib_by_name = {}
+	var f = File.new()
+	for t in tiles:
+		_lib_by_name[_name_key(t.get_base_dir().get_file())] = t
+		var n = _file_len(t)
+		if n > 0:
+			var m = f.get_md5(t)
+			if m != "":
+				_lib_by_md5[m] = t
+				_lib_lens[n] = true
+
+
+# A texture from an asset path, shared with DD when it already loaded it (the
+# path is what maps save).
+func _load_asset_tex(path: String, repeat: bool = true):
+	if path == "":
+		return null
+	if ResourceLoader.has_cached(path):
+		var c = ResourceLoader.load(path)
+		if c is Texture:
+			return c
+	if path.begins_with("res://textures/") and ResourceLoader.exists(path):
+		var r = ResourceLoader.load(path, "Texture")
+		if r is Texture:
+			return r
+	var img = Image.new()
+	if img.load(path) != OK:
+		if ResourceLoader.exists(path):
+			return ResourceLoader.load(path, "Texture")
+		return null
+	var tex = ImageTexture.new()
+	var flags = Texture.FLAG_MIPMAPS | Texture.FLAG_FILTER
+	if repeat:
+		flags |= Texture.FLAG_REPEAT
+	tex.create_from_image(img, flags)
+	tex.take_over_path(path)
+	return tex
+
+
+# Ridge / hip / edge strips of a roof texture: from its Roof Tool folder, or
+# found through the file when the same texture is also given as a pattern.
+func _roof_pieces(tex: Texture) -> Dictionary:
+	if tex == null or tex.resource_path == "":
+		return {}
+	var path = tex.resource_path
+	if _pieces_cache.has(path):
+		return _pieces_cache[path]
+	var out = {}
+	var tiles = ""
+	if path.get_file().get_basename() == "tiles" and path.get_base_dir().get_base_dir().get_file() == "roofs":
+		tiles = path
+	else:
+		_lib_build()
+		if not _lib_built:
+			# The Roof Tool's list is not there yet: try again later.
+			return out
+		if _file_len(path) > 0:
+			tiles = _lib_by_md5.get(File.new().get_md5(path), "")
+		if tiles == "":
+			# DD's own assets are imported (no file to compare): by name.
+			tiles = _lib_by_name.get(_name_key(path.get_file().get_basename()), "")
+	_pieces_cache[path] = out
+	if tiles == "":
+		return out
+	var files = _file_exts_in(tiles.get_base_dir())
+	for piece in ["ridge", "hip", "edge"]:
+		# As DD finds them: beside the tiles, same extension first.
+		var exts = [tiles.get_extension()] + ROOF_IMG_EXTS
+		for e in exts:
+			var cand = tiles.get_base_dir().plus_file(piece + "." + e)
+			if files.has(piece + "." + e) or ResourceLoader.exists(cand) or File.new().file_exists(cand):
+				var pt = _load_asset_tex(cand, true)
+				if pt != null and pt.get_height() > 0:
+					out[piece] = pt
+					break
+	return out
+
+
+# Name of a texture reduced to letters and digits, lower case.
+func _name_key(n: String) -> String:
+	var out = ""
+	for ch in n.to_lower():
+		if (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9"):
+			out += ch
+	return out
+
+
+var _vis_cache = {}
+
+
+# Rows of a strip texture (0..1) where it is mostly opaque.
+func _strip_vis(tex: Texture) -> Vector2:
+	var id = tex.get_instance_id()
+	if _vis_cache.has(id):
+		return _vis_cache[id]
+	var out = Vector2(0, 1)
+	var img = tex.get_data()
+	if img != null and not img.is_empty():
+		if img.is_compressed():
+			img.decompress()
+		img.convert(Image.FORMAT_RGBA8)
+		var w = img.get_width()
+		var h = img.get_height()
+		var px = img.get_data()
+		var step = max(1, w / 64)
+		var lo = -1
+		var hi = -1
+		for y in range(h):
+			var sa = 0
+			var n = 0
+			for x in range(0, w, step):
+				sa += px[(y * w + x) * 4 + 3]
+				n += 1
+			if float(sa) / (255.0 * n) > 0.5:
+				if lo < 0:
+					lo = y
+				hi = y
+		if lo >= 0:
+			out = Vector2(float(lo) / h, float(hi + 1) / h)
+	_vis_cache[id] = out
+	return out
+
+
+# ── Roof Tool textures in the pattern lists ──
+#
+# The pattern lists (Pattern Tool and Select Tool) get the Roof Tool's own
+# list items appended (same thumbnails, names and paths), minus the files
+# already given as patterns. DD's list does not know these items: clicks on
+# them are taken before it (gui_input comes first) and applied here.
+
+const LIB_SETTINGS = "user://better_roof_patterns_settings.json"
+
+var _lib_on = false
+var _lib_dirty = false        # items to take out of the lists (turned off)
+var _lib_loaded = false
+var _lib_grids = {}           # pattern list -> "tool" / "select"
+
+
+func _lib_load_settings() -> void:
+	if _lib_loaded:
+		return
+	_lib_loaded = true
+	var f = File.new()
+	if f.file_exists(LIB_SETTINGS) and f.open(LIB_SETTINGS, File.READ) == OK:
+		var res = JSON.parse(f.get_as_text())
+		f.close()
+		if res.error == OK and res.result is Dictionary:
+			_lib_on = bool(res.result.get("roof_tool_library", false))
+
+
+func _lib_save_settings() -> void:
+	var f = File.new()
+	if f.open(LIB_SETTINGS, File.WRITE) == OK:
+		f.store_string(JSON.print({"roof_tool_library": _lib_on}))
+		f.close()
+
+
+func _on_lib_toggled(pressed: bool) -> void:
+	if pressed == _lib_on:
+		return
+	_lib_on = pressed
+	_lib_dirty = true
+	_lib_logged = false
+	_lib_save_settings()
+	for sec in ["tool", "select"]:
+		var c = _ui.get(sec)
+		if c != null and c.has("lib") and is_instance_valid(c["lib"]) and c["lib"].pressed != pressed:
+			c["lib"].pressed = pressed
+	_lib_sync()
+
+
+const LIB_MARK = "\n(Roof Tool)"
+
+
+# The texture lists (GridMenu) of a tool panel; patterns: only those listing
+# pattern textures.
+const LIB_CONTROLS = {"PatternShapeTool": "Texture", "SelectTool": "PatternTexture", "RoofTool": "Texture"}
+
+
+func _grid_menus(tool_name: String, patterns: bool) -> Array:
+	var out = []
+	if _g == null or _g.Editor == null or _g.Editor.get("Toolset") == null:
+		return out
+	# The list registered by DD (found even when another mod moved it out of
+	# the tool panel).
+	var tools = _g.Editor.get("Tools")
+	var tl = tools.get(tool_name) if tools is Dictionary else null
+	var controls = tl.get("Controls") if tl != null else null
+	if controls is Dictionary:
+		var ctl = controls.get(LIB_CONTROLS.get(tool_name, ""))
+		if ctl is ItemList and is_instance_valid(ctl):
+			out.append(ctl)
+			return out
+	var panel = _g.Editor.Toolset.GetToolPanel(tool_name)
+	if panel == null:
+		return out
+	var stack = [panel]
+	while not stack.empty():
+		var n = stack.pop_back()
+		if n is ItemList:
+			# DD's texture lists keep each item's file path as metadata
+			# (patterns come after the simple tiles: look through all).
+			var key = "/patterns/" if patterns else "/roofs/"
+			for i in range(n.get_item_count()):
+				var m = n.get_item_metadata(i)
+				if m is String and m.find(key) >= 0:
+					out.append(n)
+					break
+		for ch in n.get_children():
+			stack.push_back(ch)
+	return out
+
+
+func _grid_menu(tool_name: String, patterns: bool):
+	var l = _grid_menus(tool_name, patterns)
+	return l[0] if not l.empty() else null
+
+
+# Roof Tool list items not already given as patterns: [{path, icon, tip}].
+func _roof_items(pattern_paths: Array) -> Array:
+	var out = []
+	_lib_stats = [0, 0]
+	var roof_grid = _grid_menu("RoofTool", false)
+	if roof_grid == null:
+		return out
+	var f = File.new()
+	var by_len = {}
+	for p in pattern_paths:
+		var n = _file_len(p)
+		if n > 0:
+			if not by_len.has(n):
+				by_len[n] = []
+			by_len[n].append(p)
+	var seen = {}
+	var pat_names = {}
+	for p in pattern_paths:
+		if _file_len(p) <= 0:
+			pat_names[_name_key(p.get_file().get_basename())] = true
+	_lib_stats = [roof_grid.get_item_count(), 0]
+	for i in range(roof_grid.get_item_count()):
+		var path = roof_grid.get_item_metadata(i)
+		if not (path is String) or path == "" or pattern_paths.has(path):
+			continue
+		var n2 = _file_len(path)
+		var m = f.get_md5(path) if n2 > 0 else path
+		if seen.has(m):
+			continue
+		seen[m] = true
+		var dup = false
+		if by_len.has(n2):
+			for p2 in by_len[n2]:
+				if f.get_md5(p2) == m:
+					dup = true
+					break
+		if not dup and n2 <= 0 and pat_names.has(_name_key(path.get_base_dir().get_file())):
+			# DD's own (imported) assets: same name given as a pattern.
+			dup = true
+		if dup:
+			_lib_stats[1] += 1
+		else:
+			out.append({"path": path, "icon": roof_grid.get_item_icon(i), "tip": roof_grid.get_item_tooltip(i)})
+	return out
+
+
+class LibInput:
+	extends Node
+	var mod = null
+	func _input(event):
+		if mod != null:
+			mod._lib_input(event)
+
+
+var _lib_listener = null
+var _lib_logged = false
+var _link_k = 100.0
+var _sel_tex_sig = ""
+var _lib_prev_color = null    # Pattern Tool colour while a Roof Tool texture is picked
+var _lib_stats = [0, 0]       # Roof Tool textures, already given as patterns
+
+
+# Auto Roof Library: while Roof Builder is on, the pattern lists only show
+# roof textures: the patterns that are also Roof Tool textures (same file)
+# or kept in a folder whose name has "roof" in it, then the Roof Tool
+# textures given only to the Roof Tool. The full list comes back (in DD's order, so its own bookkeeping still matches) when
+# Roof Builder is off. DD rebuilding a list (filters, assets) is noticed and
+# filtered again. Roof Tool items are told apart by the end of their tooltip.
+var _lib_state = {}           # pattern list -> {snap: [items], shown: [paths]}
+var _roof_pat = {}            # pattern path -> counts as a roof
+
+
+var _lib_icons = {}
+
+
+# The Roof Tool's thumbnail, wrapped: DD's thumbnails carry a "thumbnail"
+# meta, and on enabling the Pattern Tool DD looks every thumbnail of the list
+# up among the patterns (IsTextureCustomColor): a Roof Tool one is not found
+# there and the null path throws, which broke the tool panel switching. A
+# new AtlasTexture shows the same picture with no meta and no path.
+func _lib_icon(icon):
+	if icon == null:
+		return null
+	var id = icon.get_instance_id()
+	if _lib_icons.has(id) and is_instance_valid(_lib_icons[id]):
+		return _lib_icons[id]
+	var w = AtlasTexture.new()
+	w.atlas = icon
+	w.region = Rect2(Vector2.ZERO, icon.get_size())
+	_lib_icons[id] = w
+	return w
+
+
+func _item_data(grid, i: int) -> Dictionary:
+	var mod = grid.get_item_icon_modulate(i)
+	# The tag icon cannot be read back: DD gives it to the colourable
+	# patterns, the ones it tints red.
+	var tag = null
+	if mod.r > 0.9 and mod.g < 0.1 and mod.b < 0.1 and grid.has_icon("Colorable", "Icons"):
+		tag = grid.get_icon("Colorable", "Icons")
+	return {"icon": grid.get_item_icon(i), "meta": grid.get_item_metadata(i), "tip": grid.get_item_tooltip(i),
+		"text": grid.get_item_text(i), "tag": tag, "mod": mod}
+
+
+func _add_item(grid, d: Dictionary) -> void:
+	var idx = grid.get_item_count()
+	grid.add_icon_item(d["icon"])
+	grid.set_item_metadata(idx, d["meta"])
+	grid.set_item_tooltip(idx, d["tip"])
+	if d.get("text", "") != "":
+		grid.set_item_text(idx, d["text"])
+	if d.get("tag") != null:
+		grid.set_item_tag_icon(idx, d["tag"])
+	if d.has("mod"):
+		grid.set_item_icon_modulate(idx, d["mod"])
+
+
+func _grid_paths(grid) -> Array:
+	var out = []
+	for i in range(grid.get_item_count()):
+		out.append(grid.get_item_metadata(i))
+	return out
+
+
+# A pattern that is also a Roof Tool texture (same file).
+func _is_roof_pattern(path) -> bool:
+	if not (path is String) or path == "":
+		return false
+	if _roof_pat.has(path):
+		return _roof_pat[path]
+	_lib_build()
+	# Patterns kept in a folder named after roofs (".../patterns/roofs/...",
+	# ".../Roof Tiles/..."): roofs as well.
+	var dir = path.get_base_dir()
+	var pi = dir.find("/patterns/")
+	if pi >= 0 and dir.substr(pi + 10).to_lower().find("roof") >= 0:
+		_roof_pat[path] = true
+		return true
+	var res = false
+	var n = _file_len(path)
+	if n > 0:
+		if _lib_lens.has(n):
+			res = _lib_by_md5.has(File.new().get_md5(path))
+	elif _lib_by_name.has(_name_key(path.get_file().get_basename())):
+		# DD's own (imported) assets: by name.
+		res = true
+	_roof_pat[path] = res
+	return res
+
+
+func _lib_sync() -> void:
+	var grids = {}
+	for g in _grid_menus("PatternShapeTool", true):
+		grids[g] = "tool"
+	for g in _grid_menus("SelectTool", true):
+		if not grids.has(g):
+			grids[g] = "select"
+	_lib_grids = grids
+	for grid in grids.keys():
+		# Second way in: when another mod takes the clicks first and hands
+		# them on (as Unofficial Patch does in the Select Tool), the list's
+		# item_selected listeners still hear it.
+		if not grid.is_connected("item_selected", self, "_on_lib_item_selected"):
+			grid.connect("item_selected", self, "_on_lib_item_selected", [grid])
+		var want = _lib_on and _lib_section_on(grids[grid])
+		var st = _lib_state.get(grid)
+		var filtered = st != null and _grid_paths(grid) == st["shown"]
+		if want:
+			if filtered:
+				continue
+			# DD's list as it is now (without any of our items), then only
+			# its roofs and the Roof Tool's own.
+			var snap = []
+			var pats = []
+			for i in range(grid.get_item_count()):
+				if grid.get_item_tooltip(i).ends_with(LIB_MARK):
+					continue
+				snap.append(_item_data(grid, i))
+				var m = grid.get_item_metadata(i)
+				if m is String and m != "":
+					pats.append(m)
+			var items = []
+			for d in snap:
+				if _is_roof_pattern(d["meta"]):
+					items.append(d)
+			var extra = _roof_items(pats)
+			for it in extra:
+				items.append({"icon": _lib_icon(it["icon"]), "meta": it["path"], "tip": it["tip"] + LIB_MARK})
+			if not _lib_logged:
+				_lib_logged = true
+				print("[BetterRoofPatterns] Auto Roof Library: %d roof patterns, %d Roof Tool textures added" % [items.size() - extra.size(), extra.size()])
+			grid.clear()
+			for d in items:
+				_add_item(grid, d)
+			_lib_state[grid] = {"snap": snap, "shown": _grid_paths(grid)}
+		else:
+			if filtered:
+				grid.clear()
+				for d in st["snap"]:
+					_add_item(grid, d)
+			else:
+				for i in range(grid.get_item_count() - 1, -1, -1):
+					if grid.get_item_tooltip(i).ends_with(LIB_MARK):
+						grid.remove_item(i)
+			_lib_state.erase(grid)
+	# Clicks on the Roof Tool items are taken before DD's list (and before
+	# other mods' listeners: kept last in the tree, so it hears first).
+	if _lib_on and not grids.empty() and _g.Editor is Node and _g.Editor.is_inside_tree():
+		var root = _g.Editor.get_tree().root
+		if _lib_listener == null or not is_instance_valid(_lib_listener):
+			_lib_listener = LibInput.new()
+			_lib_listener.name = "BetterRoofPatternsLibInput"
+			_lib_listener.mod = self
+			root.call_deferred("add_child", _lib_listener)
+		elif _lib_listener.is_inside_tree() and _lib_listener.get_index() != root.get_child_count() - 1:
+			root.move_child(_lib_listener, root.get_child_count() - 1)
+
+
+func _lib_section_on(sec: String) -> bool:
+	if sec == "tool":
+		return bool(_tool_cfg.get("enabled", false))
+	var c = _ui.get("select")
+	return c != null and is_instance_valid(c["header"]) and c["header"].pressed and c["root"].visible
+
+
+# DD's own texture for a Roof Tool item (the one its Roof Tool uses: known
+# to DD's library, info bar, colour checks...). Taken by having the Roof
+# Tool's list pick it, then giving the Roof Tool its texture back.
+func _dd_roof_tex(path: String):
+	var rg = _grid_menu("RoofTool", false)
+	var tools = _g.Editor.get("Tools")
+	var rt = tools.get("RoofTool") if tools is Dictionary else null
+	if rg != null and rt != null and rg.has_method("OnItemSelected"):
+		for i in range(rg.get_item_count()):
+			if rg.get_item_metadata(i) == path:
+				var prev = rt.get("Texture")
+				rg.call("OnItemSelected", i)
+				var tex = rt.get("Texture")
+				if prev != tex:
+					rt.set("Texture", prev)
+				if tex is Texture:
+					return tex
+				break
+	return _load_asset_tex(path, true)
+
+
+func _lib_input(event) -> void:
+	if not _lib_on or not (event is InputEventMouseButton) or event.button_index != BUTTON_LEFT or not event.pressed:
+		return
+	for grid in _lib_grids.keys():
+		if not is_instance_valid(grid) or not grid.is_visible_in_tree():
+			continue
+		var lp = grid.get_local_mouse_position()
+		if not Rect2(Vector2.ZERO, grid.rect_size).has_point(lp):
+			continue
+		var idx = grid.get_item_at_position(lp, true)
+		if idx < 0 or not grid.get_item_tooltip(idx).ends_with(LIB_MARK):
+			# A pattern of DD's: the Pattern Tool gets its colour back.
+			if idx >= 0 and _lib_grids[grid] == "tool" and _lib_prev_color != null:
+				var pst0 = _g.Editor.Tools.get("PatternShapeTool")
+				if pst0 != null:
+					pst0.set("Color", _lib_prev_color)
+				_lib_prev_color = null
+			return
+		# One of ours: DD's list would not find it among its patterns.
+		grid.get_tree().set_input_as_handled()
+		grid.select(idx)
+		_lib_apply(grid.get_item_metadata(idx), _lib_grids[grid])
+		return
+
+
+func _on_lib_item_selected(idx: int, grid) -> void:
+	if not is_instance_valid(grid) or idx < 0 or idx >= grid.get_item_count():
+		return
+	if grid.get_item_tooltip(idx).ends_with(LIB_MARK) and _lib_grids.has(grid):
+		_lib_apply(grid.get_item_metadata(idx), _lib_grids[grid])
+
+
+func _lib_apply(path, sec: String) -> void:
+	if not (path is String) or path == "":
+		return
+	var tex = _dd_roof_tex(path)
+	if tex == null:
+		return
+	if sec == "tool":
+		var pst = _g.Editor.Tools.get("PatternShapeTool") if _g.Editor.get("Tools") != null else null
+		if pst != null:
+			pst.set("Texture", tex)
+			# Roof Tool textures are not colourable: drawn untinted (the
+			# colour comes back with the next pattern of DD's).
+			var col = pst.get("Color")
+			if col is Color:
+				if _lib_prev_color == null:
+					_lib_prev_color = col
+				pst.set("Color", Color(1, 1, 1, col.a))
+		return
+	var sel = _sel_shapes
+	var tools = _g.Editor.get("Tools")
+	var stool = tools.get("SelectTool") if tools != null else null
+	if stool != null and stool.get("Selected") != null:
+		sel = stool.get("Selected")
+	for shape in sel:
+		if not _is_pattern_shape(shape):
+			continue
+		var mat = shape.material
+		var rot = shape.get("_Rotation")
+		if rot == null and mat is ShaderMaterial:
+			rot = mat.get_shader_param("rotation")
+		# Not colourable: untinted.
+		shape.call("SetOptions", tex, Color(1, 1, 1, shape.color.a), float(rot) if rot != null else 0.0)
+
+
+# ── Copy / paste roof settings (Select Tool) ──
+
+var _settings_clip = null
+
+
+func _on_settings_copy() -> void:
+	var store = _get_store()
+	if store == null:
+		return
+	for shape in _sel_shapes:
+		var key = _key_of(shape)
+		if key != "" and store.has(key):
+			_settings_clip = _full_cfg(store[key]).duplicate(true)
+			var c = _ui.get("select")
+			if c != null and c.get("clip") != null:
+				c["clip"].get_child(1).disabled = false
+			return
+
+
+func _on_settings_paste() -> void:
+	if _settings_clip == null:
+		return
+	var store = _get_store()
+	if store == null:
+		return
+	_roof_cache = null
+	for shape in _sel_shapes:
+		if not _is_pattern_shape(shape):
+			continue
+		var key = _key_of(shape)
+		if key == "":
+			continue
+		var cfg = _full_cfg(_settings_clip.duplicate(true))
+		store[key] = cfg
+		_sync_shape(shape, key, cfg)
+	_set_ui_values("select", _settings_clip, true)
+	_update_visibility("select")
+
+
+func _has_pieces(tex) -> bool:
+	if not (tex is Texture):
+		return false
+	var p = _roof_pieces(tex)
+	return p.has("ridge") and p.has("hip")
