@@ -57,7 +57,8 @@ Every edge is an eave and the tile rows follow the nearest edge. A rectangle get
 | **Seams** | Ridge and hip lines: **None** (plain cut), **Line** (ink line and crease shadow), **Soft** (blended over a few pixels, default) or **Ridge Caps**. Also in the Pattern Tool. |
 | **Repeat Point** | Moves where the texture repeats along the slope, when the automatic repeat shows a seam or a band. |
 | **Side Lines** | Dark outline on the sides where the texture is plainly cut (gable ends, eaves of textures without their own edge). |
-| **Ridge Caps** (Seams) / **Cap Style** / **Cap Width** / **Cap Brightness** / **Cap Outline** (None / Line / Blurred) | Covers the ridge and hip lines (Hip, Gap Free with Two Slopes) with caps made from the roof texture itself: turned tiles (half-round tiles) or a band of the texture (slates, bricks, thatch). Ridges are wider than hips; caps meet in mitred joints and follow curved ridges. Curved parts of an outline (round ends, rounded corners) get no caps. |
+| **Tile Width** / **Pitch** link | The link buttons make them move together, so the tiles keep their shape (a steeper roof shows shorter rows and narrower tiles). |
+| **Ridge Caps** (Seams) / **Cap Style** / **Cap Width** / **Cap Brightness** / **Cap Hue** / **Cap Saturation** / **Cap Outline** (None / Line / Blurred) | Covers the ridge and hip lines (Hip, Gap Free with Two Slopes) with caps made from the roof texture itself: turned tiles (half-round tiles) or a band of the texture (slates, bricks, thatch). Roof Tool textures use their own ridge and hip strips (**Roof Pieces**, greyed out for other textures; a roof whose texture has none goes back to Auto). Ridges are wider than hips; caps meet in mitred joints and follow curved ridges. Curved parts of an outline (round ends, rounded corners) get no caps. |
 | **Tile Width** | Width of the tiles. Rows keep their height, the shape keeps its size. |
 | **Edge Offset** | Moves the eave inward (+) or outward (−). Empty rows under the eave are already removed automatically. |
 | **Texture Offset** | Slides the texture sideways (Gap Free). |
@@ -71,6 +72,17 @@ Every edge is an eave and the tile rows follow the nearest edge. A rectangle get
 Every slider has a reset button. Changes apply to all selected roofs.
 
 ---
+
+## Roof Tool textures
+
+Some asset packs give their roofs to DD's Roof Tool (tiles plus ridge, hip and edge strips) rather than to the Pattern Tool.
+
+- **Auto Roof Library** (top of the Roof Builder section, Select Tool and Pattern Tool): while Roof Builder is on, the pattern list only shows roof textures — the patterns that are roofs (also given to the Roof Tool, or in a folder with "roof" in its name), then the Roof Tool's own textures. Textures a pack gives both as a roof and as a pattern (same file) are only listed once. The full list comes back when Roof Builder is off. The setting is kept for every map.
+- **Ridge Caps** use the pack's own ridge and hip strips when the roof texture comes with them (Cap Style **Roof Pieces**, picked by Auto), whether it was taken from the Roof Library or from the Patterns.
+
+## Copying settings
+
+**Copy Settings** (Select Tool, at the bottom of the Roof Builder section) takes every setting of the selected roof except its texture; **Paste Settings** gives them to the selected shapes, which become roofs if they were not.
 
 ## Merging roofs
 
@@ -112,4 +124,4 @@ Pattern shapes with the node meta `roof_builder_skip` are never turned into roof
 
 ## Author
 
-Made by **Moulk**.
+Made with Claude AI.
