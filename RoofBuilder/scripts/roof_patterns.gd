@@ -110,6 +110,11 @@ const DEFAULT_CFG = {
 	"cap_bright": 0.0,
 	"cap_hue": 0.0,
 	"cap_sat": 0.0,
+	"cap_recolor": false,
+	"cap_corners": 1,
+	"cap_tip": 35.0,
+	"ridge_ends": 0,
+	"cap_fade": 15.0,
 	"seams": SEAMS_SOFT,
 	"repeat": 0.0,
 	"round_ends": 0,
@@ -197,6 +202,9 @@ uniform sampler2D cap_hip_tex;
 // is cast around that part.
 uniform vec2 cap_ridge_vis = vec2(0.0, 1.0);
 uniform vec2 cap_hip_vis = vec2(0.0, 1.0);
+// Thickness of the dark line along the strips' sides (share of their height).
+uniform float cap_ridge_ink = 0.0;
+uniform float cap_hip_ink = 0.0;
 // Cap width base (texels): ridges get 1.15 of it, hips 0.8.
 uniform float cap_base = 64.0;
 // Hip roofs: lines ending at the centre of a curved part of the outline
@@ -270,6 +278,18 @@ uniform sampler2D bake_tex : hint_black;
 uniform vec2 bake_pos = vec2(0.0);
 uniform vec2 bake_size = vec2(1.0);
 uniform bool star_shape = true;
+// Caps' rounded tips past the outline's corners (child shape drawn above).
+uniform bool tip_mode = false;
+// Caps at the outline's corners: 0 cut like the corner (a point), 1 rounded,
+// 2 flat; tip_len: how far their end goes past the corner (visible half
+// widths).
+uniform int cap_corner = 1;
+uniform float tip_len = 0.35;
+// Ridge caps laid over the hips, ending rounded where they meet.
+uniform bool cap_ridge_top = false;
+// Where two caps meet (mitred): cross-faded over cap_fade (share of the
+// cap's half width), or a hard cut when 0.
+uniform float cap_fade = 0.2;
 uniform float own_vis = 0.0;
 // Colour and Modify Things (uchideshi34) colouring this roof: the settings of
 // its material ("ct_" + its names) and its colour steps (ct_colour, from its
@@ -1009,6 +1029,18 @@ float cap_hw(bool is_ridge, float cosn)
 	return cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * cap_scale * 0.5;
 }
 
+// Half width of the visible part of a cap (Roof Tool strips: without their
+// transparent margins).
+float cap_vhw(bool is_ridge, float hw)
+{
+	if (cap_style == 3)
+	{
+		vec2 vis = is_ridge ? cap_ridge_vis : cap_hip_vis;
+		return max(vis.y - vis.x, 0.04) * hw;
+	}
+	return hw;
+}
+
 vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw, vec4 tint, vec2 size, float cpx, inout float shadow, bool is_ridge)
 {
 	float r = length(vec2(sx, max(et, 0.0)));
@@ -1044,6 +1076,18 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 		float k = ps.y / (2.0 * hw);
 		vec2 puv = vec2(a * k / ps.x, 0.5 + 0.5 * sx);
 		float lod = max(log2(cpx * k), 0.0);
+		// Rounded end: a half circle as wide as the strip's visible part,
+		// with a dark line as thick as the one along its sides.
+		vec2 vs = is_ridge ? cap_ridge_vis : cap_hip_vis;
+		float vhs = max((vs.y - vs.x) * 0.5, 0.02);
+		float e_al = max(et, 0.0) * 0.5 / vhs;
+		float e_rv = length(vec2(((0.5 + 0.5 * sx) - (vs.x + vs.y) * 0.5) / vhs, e_al));
+		float e_px = (1.0 - e_rv) * vhs * 2.0 * hw;
+		float e_k = et > 0.0 ? clamp(e_px / cpx + 0.5, 0.0, 1.0) : 1.0;
+		if (e_k <= 0.0)
+		{
+			return vec4(0.0);
+		}
 		vec4 pc;
 		if (is_ridge)
 		{
@@ -1064,7 +1108,13 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 		{
 			pcc *= mix(1.0, 0.15, 1.0 - smoothstep(p_ink * 0.5, p_ink, (1.0 - r) * hw));
 		}
-		float pk = clamp((1.0 - r) * hw / cpx + 0.5, 0.0, 1.0) * pc.a;
+		float s_ink = (is_ridge ? cap_ridge_ink : cap_hip_ink) * 2.0 * hw;
+		if (et > 0.0 && s_ink > 0.0)
+		{
+			s_ink = max(s_ink, cpx * 1.2);
+			pcc *= mix(1.0, 0.12, (1.0 - smoothstep(s_ink - cpx, s_ink, e_px)) * smoothstep(0.0, 0.4, e_al));
+		}
+		float pk = clamp((1.0 - r) * hw / cpx + 0.5, 0.0, 1.0) * pc.a * e_k;
 		if (cap_outline == 2)
 		{
 			pk *= smoothstep(0.0, 0.55, 1.0 - r);
@@ -1244,9 +1294,10 @@ bool cap_end(int a, int b, int c, out vec2 x, out vec2 dir)
 // (none on valleys). end_on: it ends at end_p, rounded, toward end_dir.
 // r: 0 on the line, 1 on the cap's sides; where caps meet, the one with the
 // lowest r is kept (mitred joints).
-vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec4 tint, vec2 size, float cpx, inout float shadow, out float r)
+vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec4 tint, vec2 size, float cpx, inout float shadow, out float r, out float tip)
 {
 	r = 100.0;
+	tip = 0.0;
 	if (i < 0 || j < 0 || i == j)
 	{
 		return vec4(0.0);
@@ -1301,9 +1352,77 @@ vec4 crease_cap(vec2 v, int i, int j, bool end_on, vec2 end_p, vec2 end_dir, vec
 		a = dot(ei.xy - q, fi.xy) / max(abs(dot(vec2(-across.y, across.x), fi.xy)), 0.2);
 	}
 	float et = end_on ? dot(q - end_p, end_dir) / hw : 0.0;
+	vec2 e_dir = end_dir;
+	// Hip reaching an outer corner of the outline: ends there, rounded or
+	// cut square, its end tip_len past the corner (the part outside the
+	// shape is drawn by a child shape, see tip_mode).
+	bool c_i = j == (i + 1) % edge_count;
+	bool c_j = i == (j + 1) % edge_count;
+	float sq_d = 100000.0;
+	if (c_i || c_j)
+	{
+		vec2 cn = c_i ? ei.zw : ej.zw;
+		vec2 d_out = fi.xy + fj.xy;
+		if (dot(d_out, d_out) > 0.000001)
+		{
+			d_out = normalize(d_out);
+			float hv = cap_vhw(cosn < -0.7, hw);
+			if (cap_corner == 1)
+			{
+				// Centre of the round: its tip tip_len past the corner.
+				float et_c = dot(q - (cn + d_out * (tip_len - 1.0) * hv), d_out) / hw;
+				tip = smoothstep(-3.0, -2.0, et_c);
+				if (et_c > max(et, 0.0))
+				{
+					et = et_c;
+					e_dir = d_out;
+				}
+			}
+			else
+			{
+				// Square end: cut like the outline's corner (a point) or flat,
+				// tip_len past it. sq_d: distance to that cut (> 0 inside).
+				vec2 cs = cn + d_out * tip_len * hv;
+				if (cap_corner == 2)
+				{
+					// Flat: cut across the line.
+					sq_d = dot(cs - q, d_out);
+				}
+				else
+				{
+					sq_d = min(dot(cs - v, fi.xy), dot(cs - v, fj.xy));
+				}
+				tip = smoothstep(-3.0, -2.0, dot(q - cs, d_out) / hw);
+				if (sq_d < -cpx)
+				{
+					return vec4(0.0);
+				}
+			}
+		}
+	}
 	float sx = o * s / hw;
 	r = length(vec2(sx, max(et, 0.0)));
-	return cap_piece(a, sx, et, across, end_dir, hw, tint, size, cpx, shadow, cosn < -0.7);
+	vec4 ck = cap_piece(a, sx, et, across, e_dir, hw, tint, size, cpx, shadow, cosn < -0.7);
+	float own_ink = cap_style == 3 ? (cosn < -0.7 ? cap_ridge_ink : cap_hip_ink) : 0.0;
+	if (tip > 0.0 && cap_outline != 1 && own_ink <= 0.0)
+	{
+		// Ink line all around the tip (no roof around it there).
+		float t_ink = max(ink_h * 0.04, cpx * 1.5);
+		ck.rgb *= mix(1.0, 0.12, (1.0 - smoothstep(t_ink * 0.5, t_ink, (1.0 - r) * hw)) * tip);
+	}
+	if (sq_d < 100000.0)
+	{
+		// Square end: cut, with an ink line (as thick as the strip's own).
+		float q_ink = own_ink > 0.0 ? max(own_ink * 2.0 * hw, cpx * 1.2) : max(ink_h * 0.04, cpx * 1.5);
+		ck.rgb *= mix(1.0, 0.12, 1.0 - smoothstep(q_ink - cpx, q_ink, sq_d));
+		ck.a *= clamp(sq_d / cpx + 0.5, 0.0, 1.0);
+	}
+	if (cap_ridge_top && cosn < -0.7)
+	{
+		// Ridge on top of the hips (kept first, see cap_keep).
+		r -= 2.0;
+	}
+	return ck;
 }
 
 // Ridge Caps: is the line between faces a and b (b at distance db) only the
@@ -1402,6 +1521,40 @@ void cap_keep(vec4 c, float r, inout vec4 c1, inout float r1, inout vec4 c2, ino
 	}
 }
 
+// tip_mode: the caps' tips past the outline's corners, outside the shape.
+vec4 cap_tip_mode(vec2 v, vec4 tint, float cpx)
+{
+	vec2 size = vec2(textureSize(albedo, 0));
+	vec4 c_1 = vec4(0.0);
+	vec4 c_2 = vec4(0.0);
+	float r_1 = 100.0;
+	float r_2 = 100.0;
+	float reach = max(cap_hw(true, -1.0), cap_hw(false, 0.0)) * 3.0;
+	for (int c = 0; c < edge_count; c++)
+	{
+		vec4 e = texelFetch(edges, ivec2(c, 0), 0);
+		if (length(v - e.zw) < reach)
+		{
+			int j = (c + 1) % edge_count;
+			vec2 fc = texelFetch(edges, ivec2(c, 1), 0).xy;
+			vec2 fj = texelFetch(edges, ivec2(j, 1), 0).xy;
+			// Outside the shape there (the corner's two sides).
+			// (a little inside too: no gap along the outline)
+			if (dot(v - e.zw, fc) > -cpx * 1.5 || dot(v - e.zw, fj) > -cpx * 1.5)
+			{
+				float sh = 0.0;
+				float rk;
+				float tk;
+				vec4 ck = crease_cap(v, c, j, true, e.zw, vec2(0.0), tint, size, cpx, sh, rk, tk);
+				cap_keep(ck, rk, c_1, r_1, c_2, r_2);
+			}
+		}
+	}
+	float a = c_1.a + c_2.a * (1.0 - c_1.a);
+	vec3 col = (c_1.rgb * c_1.a + c_2.rgb * c_2.a * (1.0 - c_1.a)) / max(a, 0.0001);
+	return vec4(col, a);
+}
+
 // Local position of a point given in the texture's rotated frame (braw).
 vec2 cap_local(vec2 b, vec2 size)
 {
@@ -1425,6 +1578,11 @@ void fragment()
 	else if (bake_mode)
 	{
 		COLOR = vec4(vec3(bake_coverage(v_local)), 1.0);
+	}
+	else if (tip_mode)
+	{
+		float tpx = max(max(length(dFdx(v_local)), length(dFdy(v_local))), 0.0001);
+		COLOR = cap_tip_mode(v_local, COLOR, tpx);
 	}
 	else
 	{
@@ -1950,7 +2108,18 @@ void fragment()
 		}
 		if (ds < s_ink)
 		{
-			texel *= mix(1.0, 0.12, (1.0 - smoothstep(s_ink * 0.5, s_ink, ds)) * ink_a);
+			// Full ink over the eave's cut-outs too (where ink_a fades it).
+			float s_cov = (1.0 - smoothstep(s_ink * 0.5, s_ink, ds)) * max(ink_a, 1.0 - alpha);
+			texel *= mix(1.0, 0.12, s_cov);
+			// Also over the cut-outs of the eave (non seamless textures): the
+			// line runs on to the real corner of the shape and covers the
+			// notch the two eaves leave there.
+			if (alpha < 1.0 && s_cov > 0.0)
+			{
+				float na = alpha + s_cov * (1.0 - alpha);
+				texel = (texel * alpha + vec3(0.03) * s_cov * (1.0 - alpha)) / max(na, 0.0001);
+				alpha = na;
+			}
 		}
 	}
 	if (in_round && side_ink && !eave_cut)
@@ -1964,6 +2133,7 @@ void fragment()
 	{
 		float cpx = max(max(length(dx), length(dy)), 0.0001);
 		float cap_sh = 0.0;
+		float tip_k = 0.0;
 		// The two caps with the lowest r (see crease_cap).
 		vec4 cap_1 = vec4(0.0);
 		vec4 cap_2 = vec4(0.0);
@@ -2036,7 +2206,23 @@ void fragment()
 				if (length(v_local - rec.zw) < reach)
 				{
 					float rk;
-					vec4 ck = crease_cap(v_local, int(rec.x + 0.5), int(rec.y + 0.5), true, rec.zw, -texelFetch(edges, ivec2(k, 5), 0).xy, COLOR, size, cpx, cap_sh, rk);
+					float tk;
+					vec4 ck = crease_cap(v_local, int(rec.x + 0.5), int(rec.y + 0.5), true, rec.zw, -texelFetch(edges, ivec2(k, 5), 0).xy, COLOR, size, cpx, cap_sh, rk, tk);
+					tip_k = max(tip_k, tk * ck.a);
+					cap_keep(ck, rk, cap_1, r_1, cap_2, r_2);
+				}
+			}
+			if (cap_ridge_top && b1 >= 0 && b2 >= 0 && dot(n1, texelFetch(edges, ivec2(b2, 1), 0).xy) < -0.7)
+			{
+				// Ridge on top of the hips: its rounded end runs on over the
+				// face where they meet (the hips' face).
+				vec2 jx;
+				vec2 jd;
+				if (cap_end(b1, b2, fa, jx, jd) && length(v_local - jx) < reach)
+				{
+					float rk;
+					float tk;
+					vec4 ck = crease_cap(v_local, b1, b2, true, jx, jd, COLOR, size, cpx, cap_sh, rk, tk);
 					cap_keep(ck, rk, cap_1, r_1, cap_2, r_2);
 				}
 			}
@@ -2053,6 +2239,7 @@ void fragment()
 				if (bc >= 0 && dc - cap_d0 < near_d && !cap_bridged(v_local, fa, bc, dc) && !cap_skip(v_local, fa, bc, reach))
 				{
 					float rk;
+					float tk;
 					vec2 jx;
 					vec2 jd;
 					bool je = cap_end(fa, bc, o1, jx, jd);
@@ -2060,7 +2247,8 @@ void fragment()
 					{
 						je = cap_end(fa, bc, o2, jx, jd);
 					}
-					vec4 ck = crease_cap(v_local, fa, bc, je, jx, jd, COLOR, size, cpx, cap_sh, rk);
+					vec4 ck = crease_cap(v_local, fa, bc, je, jx, jd, COLOR, size, cpx, cap_sh, rk, tk);
+					tip_k = max(tip_k, tk * ck.a);
 					cap_keep(ck, rk, cap_1, r_1, cap_2, r_2);
 				}
 			}
@@ -2105,6 +2293,9 @@ void fragment()
 			cap_keep(ck, length(vec2(sx, max(et, 0.0))), cap_1, r_1, cap_2, r_2);
 		}
 		texel *= 1.0 - (cap_style == 3 ? 0.5 : 0.35) * cap_sh * cap_sh * ink_a;
+		vec3 t_before = texel;
+		float a_before = alpha;
+		float cap_cov;
 		if (cap_style == 3)
 		{
 			// Roof Tool strips (partly transparent): laid one over the
@@ -2114,22 +2305,34 @@ void fragment()
 			if (cap_2.a > 0.0)
 			{
 				// Only where the other strip is there to show through.
-				float wx = 0.5 + 0.5 * smoothstep(0.0, 0.2, r_2 - r_1);
+				float wx = cap_fade > 0.0 ? 0.5 + 0.5 * smoothstep(0.0, cap_fade, r_2 - r_1) : clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0);
 				a1 *= 1.0 - (1.0 - wx) * cap_2.a;
 			}
 			texel = mix(texel, cap_2.rgb, cap_2.a);
 			texel = mix(texel, cap_1.rgb, a1);
+			cap_cov = 1.0 - (1.0 - cap_2.a) * (1.0 - a1);
 		}
 		else
 		{
 			// Where two caps meet (mitred), blend them over about a pixel.
-			float cw = cap_2.a > 0.0 ? clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0) : 1.0;
+			float cw = cap_2.a > 0.0 ? (cap_fade > 0.0 ? 0.5 + 0.5 * smoothstep(0.0, cap_fade, r_2 - r_1) : clamp((r_2 - r_1) * hw_max / cpx + 0.5, 0.5, 1.0)) : 1.0;
 			vec4 cap_c = mix(cap_2, cap_1, cw);
 			texel = mix(texel, cap_c.rgb, cap_c.a);
+			cap_cov = cap_c.a;
+		}
+		// The caps also cover the cut-outs of the eave (corners of non
+		// seamless textures): the roof's transparency does not hide them.
+		if (alpha < 1.0 && cap_cov > 0.0)
+		{
+			float na = alpha + cap_cov * (1.0 - alpha);
+			texel = (texel - t_before * (1.0 - cap_cov) * (1.0 - alpha)) / max(na, 0.0001);
+			alpha = na;
 		}
 		// Side Lines: the caps are cut by the outline too, ink line there.
+		// Always where they cover a cut-out of the eave (non seamless
+		// texture): the eave's own ink is not there.
 		float cap_a = max(cap_1.a, cap_2.a);
-		if (side_ink && cap_a > 0.0 && edge_count > 0)
+		if ((side_ink || a_before < 0.99) && cap_a > 0.0 && edge_count > 0)
 		{
 			float c_ink = max(ink_h * 0.04, cpx * 1.5);
 			float de_min = 1000000.0;
@@ -2140,7 +2343,9 @@ void fragment()
 				float h = clamp(dot(v_local - e.xy, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
 				de_min = min(de_min, length(v_local - e.xy - ab * h));
 			}
-			texel *= mix(1.0, 0.12, (1.0 - smoothstep(c_ink * 0.5, c_ink, de_min)) * cap_a * ink_a);
+			// (the cap is opaque even where the roof texture is not)
+			// (none on the caps' tips: they run on past the outline)
+			texel *= mix(1.0, 0.12, (1.0 - smoothstep(c_ink * 0.5, c_ink, de_min)) * max(cap_a - tip_k, 0.0));
 		}
 	}
 	float keep = round_keep;
@@ -2321,7 +2526,7 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["curve", "repeat", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in ["curve", "repeat", "cap_tip", "cap_fade", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
 		out[k] = float(out[k])
 	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps", "size_link"]:
 		out[k] = bool(out[k])
@@ -2339,6 +2544,12 @@ func _full_cfg(cfg) -> Dictionary:
 	out["cap_outline"] = int(clamp(int(out["cap_outline"]), 0, 2))
 	out["round_ends"] = int(clamp(int(out["round_ends"]), 0, 3))
 	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, 3))
+	out["cap_corners"] = int(clamp(int(out["cap_corners"]), 0, 2))
+	# Cap Recolor: on for older roofs with a recolor set.
+	if not (cfg is Dictionary and cfg.has("cap_recolor")):
+		out["cap_recolor"] = out["cap_bright"] != 0.0 or out["cap_hue"] != 0.0 or out["cap_sat"] != 0.0
+	out["cap_recolor"] = bool(out["cap_recolor"])
+	out["ridge_ends"] = int(clamp(int(out["ridge_ends"]), 0, 1))
 	return out
 
 
@@ -2523,6 +2734,7 @@ func _sync_shape(node, key: String, cfg) -> void:
 			# Free Transform (Unofficial Patch) owns this shape for now.
 			if code.find("ft_corner_tl") >= 0:
 				_remove_skirt(node, st)
+				_remove_tips(node)
 				return
 			var nm = null
 			if _is_ct_material(mat):
@@ -2601,12 +2813,14 @@ func _sync_shape(node, key: String, cfg) -> void:
 		if lsig != st.get("lsig", ""):
 			st["lsig"] = lsig
 			_set_light(mat, full, st)
+			_update_tips(node, mat)
 		return
 	st["sig"] = sig
 	_geo_rev += 1
 	st["lsig"] = lsig
 	update_material(mat, node.polygon, full, st)
 	_update_skirt(node, mat, full, st)
+	_update_tips(node, mat)
 
 
 # Colour and Modify Things (uchideshi34) colours a pattern by giving it a
@@ -2751,6 +2965,7 @@ func _signature(node, mat, cfg: Dictionary) -> String:
 
 
 const SKIRT_NAME = "BRPContactShadow"
+const TIPS_NAME = "BRPCapTips"
 const BAKE_HOLDER = "BetterRoofPatternsBakes"
 const BAKE_SAMPLES = 64           # disc samples per baked texel
 const BAKE_TEXELS_PER_W = 6.0     # baked texels across the shadow width
@@ -2944,6 +3159,76 @@ func _bake_holder(tree: SceneTree) -> Node:
 			_bake_root.name = BAKE_HOLDER
 			tree.root.add_child(_bake_root)
 	return _bake_root
+
+
+# Ridge Caps on Hip roofs with a non seamless texture: their rounded tips go
+# a little past the outline's corners. Small squares around the corners, drawn
+# above the shape with a copy of its material (tip_mode), show that part.
+func _update_tips(node, mat: ShaderMaterial) -> void:
+	var holder = node.get_node_or_null(TIPS_NAME)
+	var poly: PoolVector2Array = node.polygon
+	var n = poly.size()
+	var need = n >= 3 and int(mat.get_shader_param("roof_mode")) == MODE_HIP \
+		and mat.get_shader_param("ridge_caps") == true \
+		and int(mat.get_shader_param("edge_count")) > 0
+	if not need:
+		_remove_tips(node)
+		return
+	# Reach of a tip: a few cap half widths.
+	var cs = float(mat.get_shader_param("cap_scale"))
+	var hw = float(mat.get_shader_param("cap_base")) * 1.15 * cs * 0.5
+	if int(mat.get_shader_param("cap_style")) == 3:
+		for k in ["cap_ridge_tex", "cap_hip_tex"]:
+			var t = mat.get_shader_param(k)
+			if t is Texture:
+				hw = max(hw, t.get_height() * 0.5 * cs)
+	var tl = mat.get_shader_param("tip_len")
+	var reach = max(hw, 1.0) * (3.0 + max(float(tl) if tl != null else 0.0, 0.0))
+	# Outer corners (turning by more than ~20 degrees).
+	var area = 0.0
+	for k in range(n):
+		area += poly[k].cross(poly[(k + 1) % n])
+	var quads = []
+	for k in range(n):
+		var a = poly[(k + n - 1) % n]
+		var b = poly[k]
+		var c = poly[(k + 1) % n]
+		var d1 = b - a
+		var d2 = c - b
+		if d1.length_squared() < 0.0001 or d2.length_squared() < 0.0001:
+			continue
+		var cr = d1.normalized().cross(d2.normalized())
+		if cr * sign(area) > 0.34 and quads.size() < 64:
+			quads.append(b)
+	if holder == null:
+		holder = Node2D.new()
+		holder.name = TIPS_NAME
+		node.add_child(holder)
+	var tm = mat.duplicate()
+	tm.set_shader_param("tip_mode", true)
+	var kids = holder.get_children()
+	for k in range(max(kids.size(), quads.size())):
+		if k >= quads.size():
+			holder.remove_child(kids[k])
+			kids[k].queue_free()
+			continue
+		var p: Polygon2D = kids[k] if k < kids.size() else null
+		if p == null:
+			p = Polygon2D.new()
+			holder.add_child(p)
+		var q: Vector2 = quads[k]
+		p.polygon = PoolVector2Array([q + Vector2(-reach, -reach), q + Vector2(reach, -reach),
+			q + Vector2(reach, reach), q + Vector2(-reach, reach)])
+		p.color = node.color
+		p.material = tm
+
+
+func _remove_tips(node) -> void:
+	if node != null and is_instance_valid(node):
+		var tips = node.get_node_or_null(TIPS_NAME)
+		if tips != null:
+			node.remove_child(tips)
+			tips.queue_free()
 
 
 func _remove_skirt(node, st) -> void:
@@ -3312,6 +3597,7 @@ func _restore_shape(node, key: String) -> void:
 	# Lets DD rebuild its own pattern material (SetOptions replaces any
 	# material whose shader is not DD's).
 	_remove_skirt(node if _is_pattern_shape(node) else null, _states.get(key))
+	_remove_tips(node if _is_pattern_shape(node) else null)
 	_drop_state(key)
 	if not _is_pattern_shape(node):
 		return
@@ -3367,12 +3653,19 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	mat.set_shader_param("side_ink", bool(cfg.get("side_ink", true)))
 	mat.set_shader_param("ridge_caps", seams == SEAMS_CAPS)
 	mat.set_shader_param("cap_outline", int(cfg.get("cap_outline", 1)))
+	mat.set_shader_param("cap_corner", int(cfg.get("cap_corners", 1)))
+	mat.set_shader_param("tip_len", clamp(float(cfg.get("cap_tip", 35.0)), -300.0, 200.0) / 100.0)
+	var rends = int(cfg.get("ridge_ends", 0))
+	mat.set_shader_param("cap_ridge_top", rends == 1)
+	mat.set_shader_param("cap_fade", clamp(float(cfg.get("cap_fade", 15.0)), 0.0, 100.0) / 100.0 if rends == 0 else 0.0)
 	# Cap Brightness -100..100 %: gamma 2 .. 0.5.
 	# Cap Brightness -100..100 %: gamma 4 .. 0.25.
-	mat.set_shader_param("cap_gamma", pow(4.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0))
-	mat.set_shader_param("cap_hue", clamp(float(cfg.get("cap_hue", 0.0)), -180.0, 180.0) / 360.0)
+	# (only with Cap Recolor on)
+	var rc = bool(cfg.get("cap_recolor", false))
+	mat.set_shader_param("cap_gamma", pow(4.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0) if rc else 1.0)
+	mat.set_shader_param("cap_hue", clamp(float(cfg.get("cap_hue", 0.0)), -180.0, 180.0) / 360.0 if rc else 0.0)
 	# Cap Saturation -100..100 %: grey .. twice as saturated.
-	mat.set_shader_param("cap_sat", 1.0 + clamp(float(cfg.get("cap_sat", 0.0)), -100.0, 100.0) / 100.0)
+	mat.set_shader_param("cap_sat", 1.0 + clamp(float(cfg.get("cap_sat", 0.0)), -100.0, 100.0) / 100.0 if rc else 1.0)
 	mat.set_shader_param("cap_scale", clamp(float(cfg.get("cap_width", 100.0)), 10.0, 500.0) / 100.0)
 	# Cap width from the tile rows (textures without rows: a quarter of the
 	# texture height at most).
@@ -3393,6 +3686,8 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 		mat.set_shader_param("cap_hip_tex", pieces["hip"])
 		mat.set_shader_param("cap_ridge_vis", _strip_vis(pieces["ridge"]))
 		mat.set_shader_param("cap_hip_vis", _strip_vis(pieces["hip"]))
+		mat.set_shader_param("cap_ridge_ink", _strip_ink(pieces["ridge"]))
+		mat.set_shader_param("cap_hip_ink", _strip_ink(pieces["hip"]))
 	if cstyle == 0:
 		# Auto: narrow single tiles (half-round tiles...) are turned along the
 		# line, anything else (slates, bricks, thatch...) laid as a band.
@@ -4870,14 +5165,32 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["cap_outline"] = _make_option(opts, "Cap Outline", ["None", "Line", "Blurred"],
 			"Edge of the ridge caps: plain, a black ink line, or blurred\n(the cap fades out toward its sides).",
 			section, "cap_outline")
+		c["cap_corners"] = _make_option(opts, "Cap Corners Style", ["Square", "Round", "Flat"],
+			"End of the hips at the corners of the shape: cut like the\ncorner (a point), rounded (half circle) or cut flat across.",
+			section, "cap_corners")
+		c["cap_tip"] = _make_slider(opts, "Cap Corners Length", -300.0, 200.0, "%",
+			"How far the end of the hips goes past the corner of the shape\n(in half cap widths; below 0%: short of the corner).",
+			section, "cap_tip", icon_reset)
+		c["ridge_ends"] = _make_option(opts, "Ridge Ends", ["Mitred Faded", "Round"],
+			"Where the caps meet: mitred joint, cross-faded over Ridge Fade\n(0%: hard cut), or the ridge laid over the hips, ending in a\nhalf circle (like Round Ends).",
+			section, "ridge_ends")
+		c["cap_fade"] = _make_slider(opts, "Ridge Fade", 0.0, 100.0, "%",
+			"Width of the cross-fade where the caps meet (0%: hard cut).",
+			section, "cap_fade", icon_reset)
+		c["cap_recolor"] = _make_toggle(opts, "Cap Recolor",
+			"Changes the brightness, hue and saturation of the ridge caps.",
+			section, "cap_recolor")
+		c["corners_cog"] = _make_cog(section, "Cap Corners settings: length.")
+		c["cap_corners"]["row"].add_child(c["corners_cog"])
+		c["ridge_cog"] = _make_cog(section, "Ridge Ends settings: fade.")
+		c["ridge_ends"]["row"].add_child(c["ridge_cog"])
 		c["cap_sep"] = HSeparator.new()
 		opts.add_child(c["cap_sep"])
 		# Ridge Caps settings: under the Seams menu, shown with its cog.
 		c["seams_cog"] = _make_cog(section, "Ridge Caps settings: style, width, brightness and outline.")
 		c["seams"]["row"].add_child(c["seams_cog"])
-		c["seams"]["row"].move_child(c["seams_cog"], 1)
 		c["cap_box"] = _make_box(opts, c["seams"]["row"].get_index() + 1,
-			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_outline"]["row"], c["cap_sep"]])
+			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_outline"]["row"], c["cap_corners"]["row"], c["cap_tip"]["row"], c["ridge_ends"]["row"], c["cap_fade"]["row"], c["cap_recolor"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_sep"]])
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
@@ -5408,6 +5721,11 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		_set_ctl(c["cap_hue"], full["cap_hue"])
 		_set_ctl(c["cap_sat"], full["cap_sat"])
 		c["cap_style"]["option"].select(full["cap_style"])
+		c["cap_corners"]["option"].select(full["cap_corners"])
+		_set_ctl(c["cap_tip"], full["cap_tip"])
+		c["ridge_ends"]["option"].select(full["ridge_ends"])
+		c["cap_recolor"].pressed = full["cap_recolor"]
+		_set_ctl(c["cap_fade"], full["cap_fade"])
 		c["apex_x"].value = round(full["apex_x"] * 100.0)
 		c["apex_y"].value = round(full["apex_y"] * 100.0)
 		_set_dial(c, full["apex_x"], full["apex_y"])
@@ -5461,6 +5779,11 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		cfg["cap_hue"] = float(c["cap_hue"]["spin"].value)
 		cfg["cap_sat"] = float(c["cap_sat"]["spin"].value)
 		cfg["cap_style"] = c["cap_style"]["option"].selected
+		cfg["cap_corners"] = c["cap_corners"]["option"].selected
+		cfg["cap_tip"] = float(c["cap_tip"]["spin"].value)
+		cfg["ridge_ends"] = c["ridge_ends"]["option"].selected
+		cfg["cap_recolor"] = c["cap_recolor"].pressed
+		cfg["cap_fade"] = float(c["cap_fade"]["spin"].value)
 		cfg["apex_x"] = float(c["apex_x"].value) / 100.0
 		cfg["apex_y"] = float(c["apex_y"].value) / 100.0
 		cfg["apex_lock"] = c["apex_lock"].pressed
@@ -5515,6 +5838,13 @@ func _update_visibility(section: String) -> void:
 	c["seams_cog"].disabled = not caps_on
 	c["seams_cog"].modulate = Color(1, 1, 1, 1) if caps_on else Color(1, 1, 1, 0.35)
 	c["cap_box"].visible = caps_on and c["seams_cog"].pressed
+	var mitred = c["ridge_ends"]["option"].selected == 0
+	c["ridge_cog"].disabled = not mitred
+	c["ridge_cog"].modulate = Color(1, 1, 1, 1) if mitred else Color(1, 1, 1, 0.35)
+	c["cap_fade"]["row"].visible = mitred and c["ridge_cog"].pressed
+	c["cap_tip"]["row"].visible = c["corners_cog"].pressed
+	for k in ["cap_bright", "cap_hue", "cap_sat"]:
+		c[k]["row"].visible = c["cap_recolor"].pressed
 	c["tex_box"].visible = c["tex_cog"].pressed
 	c["shade_on"].visible = shaded
 	c["shade_sep"].visible = shaded
@@ -6115,6 +6445,53 @@ func _strip_vis(tex: Texture) -> Vector2:
 		if lo >= 0:
 			out = Vector2(float(lo) / h, float(hi + 1) / h)
 	_vis_cache[id] = out
+	return out
+
+
+# Thickness of the dark line along the sides of a Roof Tool strip (share of
+# its height): rows darker than half the strip's middle, from each edge of its
+# visible part in.
+var _ink_cache = {}
+
+func _strip_ink(tex: Texture) -> float:
+	var id = tex.get_instance_id()
+	if _ink_cache.has(id):
+		return _ink_cache[id]
+	var out = 0.0
+	var vis = _strip_vis(tex)
+	var img = tex.get_data()
+	if img != null and not img.is_empty():
+		if img.is_compressed():
+			img.decompress()
+		img.convert(Image.FORMAT_RGBA8)
+		var w = img.get_width()
+		var h = img.get_height()
+		var px = img.get_data()
+		var step = max(1, w / 64)
+		var lo = int(vis.x * h)
+		var hi = int(vis.y * h) - 1
+		var lum = []
+		for y in range(lo, hi + 1):
+			var sl = 0.0
+			var n = 0
+			for x in range(0, w, step):
+				var i = (y * w + x) * 4
+				if px[i + 3] > 127:
+					sl += 0.3 * px[i] + 0.59 * px[i + 1] + 0.11 * px[i + 2]
+					n += 1
+			lum.append(sl / n if n > 0 else 0.0)
+		if lum.size() >= 6:
+			var mid = lum.duplicate()
+			mid.sort()
+			var ref = float(mid[mid.size() / 2])
+			var t = 0
+			while t < lum.size() / 3 and lum[t] < ref * 0.5:
+				t += 1
+			var b = 0
+			while b < lum.size() / 3 and lum[lum.size() - 1 - b] < ref * 0.5:
+				b += 1
+			out = (t + b) * 0.5 / float(h)
+	_ink_cache[id] = out
 	return out
 
 

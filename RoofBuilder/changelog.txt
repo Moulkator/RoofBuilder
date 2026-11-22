@@ -1,5 +1,17 @@
 ROOF BUILDER
 
+1.2.1
+NEW:
+- Added Cap Corners Style (Square / Round / Flat) and Cap Corners Length: hips end in a point, a half circle or a flat cut at the shape's corners, past the outline or short of it
+- Added Ridge Ends (Mitred Faded / Round) and Ridge Fade slider: cross-faded joints (0% for a hard cut), or the ridge laid over the hips, ending in a half circle
+- Added Cap Recolor button: shows Cap Brightness, Cap Hue and Cap Saturation
+ 
+CHANGED:
+- Improved corners on non-seamless textures: Line seams and Ridge Caps run on to the real corner.
+- Improved Roof Pieces round ends: real half circles, with a dark line as thick as the strip's own.
+- Moved the Ridge Caps cog to the right of the Seams menu. Cap Corners Length and Ridge Fade have their own cogs.
+
+
 1.2.0
 NEW:
 - Added Auto Roof Library: while Roof Builder is on, the pattern list only shows roofs, including the Roof Tool's textures
