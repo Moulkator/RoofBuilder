@@ -60,6 +60,10 @@ const SEAMS_NONE = 0
 const SEAMS_LINE = 1
 const SEAMS_SOFT = 2
 const SEAMS_CAPS = 3
+# Cap Style Path: Path Tool textures as ridge / hip caps.
+const CAP_PATH = 4
+# Ridge Path "Same as Hip".
+const PATH_SAME_HIP = "@hip"
 const LUT_N = 512
 const MAX_MERGE = 8
 const SMOOTH_MIN_POINTS = 16
@@ -105,12 +109,17 @@ const DEFAULT_CFG = {
 	"side_ink": true,
 	"ridge_caps": false,
 	"cap_width": 100.0,
+	"cap_width_hip": 100.0,
+	"cap_width_on": 2,
 	"cap_style": 0,
+	"cap_path_ridge": "",
+	"cap_path_hip": "",
 	"cap_outline": 1,
 	"cap_bright": 0.0,
 	"cap_hue": 0.0,
 	"cap_sat": 0.0,
 	"cap_recolor": false,
+	"cap_recolor_on": 2,
 	"cap_corners": 1,
 	"cap_tip": 35.0,
 	"ridge_ends": 0,
@@ -192,6 +201,8 @@ uniform bool mirror = false;
 // ridge / hip lines (one tile column wide, times cap_scale).
 uniform bool ridge_caps = false;
 uniform float cap_scale = 1.0;
+uniform float cap_scale_hip = 1.0;
+uniform int cap_tone_on = 2;
 // 1 = tiles (one tile column turned along the line, for half-round tiles),
 // 2 = band (one course of the texture laid along the line), 3 = the roof's
 // own ridge / hip strips (Roof Tool assets).
@@ -1004,9 +1015,14 @@ float shade_light(vec2 n)
 }
 
 // Half width of a cap (ridge or hip), in local pixels.
-// Cap Brightness, Hue and Saturation.
-vec3 cap_tone(vec3 c)
+// Cap Brightness, Hue and Saturation (on the hips, the ridges or both:
+// cap_tone_on 0 / 1 / 2).
+vec3 cap_tone(vec3 c, bool is_ridge)
 {
+	if ((cap_tone_on == 0 && is_ridge) || (cap_tone_on == 1 && !is_ridge))
+	{
+		return c;
+	}
 	c = pow(max(c, vec3(0.0)), vec3(cap_gamma));
 	if (abs(cap_hue) > 0.0001 || abs(cap_sat - 1.0) > 0.0001)
 	{
@@ -1024,9 +1040,9 @@ float cap_hw(bool is_ridge, float cosn)
 	{
 		// Roof Tool strips: as wide as they are tall (as DD draws them).
 		vec2 ps = vec2(is_ridge ? textureSize(cap_ridge_tex, 0) : textureSize(cap_hip_tex, 0));
-		return max(ps.y, 2.0) * 0.5 * cap_scale;
+		return max(ps.y, 2.0) * 0.5 * (is_ridge ? cap_scale : cap_scale_hip);
 	}
-	return cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * cap_scale * 0.5;
+	return cap_base * mix(0.8, 1.15, clamp(-cosn, 0.0, 1.0)) * (is_ridge ? cap_scale : cap_scale_hip) * 0.5;
 }
 
 // Half width of the visible part of a cap (Roof Tool strips: without their
@@ -1098,7 +1114,7 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 			pc = textureLod(cap_hip_tex, puv, lod);
 		}
 		vec3 pcc = ct_on ? ct_colour(pc).rgb : pc.rgb * tint.rgb;
-		pcc = cap_tone(pcc);
+		pcc = cap_tone(pcc, is_ridge);
 		if (shade > 0.0)
 		{
 			pcc *= shade_light(across * sx * 0.5 + end_dir * max(et, 0.0));
@@ -1138,7 +1154,7 @@ vec4 cap_piece(float a, float sx, float et, vec2 across, vec2 end_dir, float hw,
 	}
 	vec4 cap = textureLod(albedo, vec2(cuv.x, cuv.y / size.y), max(log2(cpx / k_len), 0.0));
 	vec3 cc = ct_on ? ct_colour(cap).rgb : cap.rgb * tint.rgb;
-	cc = cap_tone(cc);
+	cc = cap_tone(cc, is_ridge);
 	// Rounded: darker toward its sides and end, lit across.
 	cc *= 1.0 - 0.3 * r * r;
 	if (shade > 0.0)
@@ -1279,7 +1295,7 @@ bool cap_end(int a, int b, int c, out vec2 x, out vec2 dir)
 	float c2 = ha - dot(ec.xy, nc);
 	x = vec2(c1 * r2.y - c2 * r1.y, r1.x * c2 - r2.x * c1) / det;
 	vec2 cd = normalize(vec2(-r1.y, r1.x));
-	float pr = max(cap_base * cap_scale * 0.5, 1.0);
+	float pr = max(cap_base * max(cap_scale, cap_scale_hip) * 0.5, 1.0);
 	bool s1 = cap_runs(x + cd * pr, a, b, c);
 	bool s2 = cap_runs(x - cd * pr, a, b, c);
 	if (s1 == s2)
@@ -2526,7 +2542,7 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["curve", "repeat", "cap_tip", "cap_fade", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in ["curve", "repeat", "cap_width_hip", "cap_tip", "cap_fade", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
 		out[k] = float(out[k])
 	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps", "size_link"]:
 		out[k] = bool(out[k])
@@ -2543,12 +2559,19 @@ func _full_cfg(cfg) -> Dictionary:
 	out.erase("cap_ink")
 	out["cap_outline"] = int(clamp(int(out["cap_outline"]), 0, 2))
 	out["round_ends"] = int(clamp(int(out["round_ends"]), 0, 3))
-	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, 3))
+	out["cap_style"] = int(clamp(int(out["cap_style"]), 0, CAP_PATH))
+	out["cap_path_ridge"] = str(out["cap_path_ridge"])
+	out["cap_path_hip"] = str(out["cap_path_hip"])
+	# Older roofs: one Cap Width for both.
+	if not (cfg is Dictionary and cfg.has("cap_width_hip")):
+		out["cap_width_hip"] = float(out["cap_width"])
+	out["cap_width_on"] = int(clamp(int(out["cap_width_on"]), 0, 2))
 	out["cap_corners"] = int(clamp(int(out["cap_corners"]), 0, 2))
 	# Cap Recolor: on for older roofs with a recolor set.
 	if not (cfg is Dictionary and cfg.has("cap_recolor")):
 		out["cap_recolor"] = out["cap_bright"] != 0.0 or out["cap_hue"] != 0.0 or out["cap_sat"] != 0.0
 	out["cap_recolor"] = bool(out["cap_recolor"])
+	out["cap_recolor_on"] = int(clamp(int(out["cap_recolor_on"]), 0, 2))
 	out["ridge_ends"] = int(clamp(int(out["ridge_ends"]), 0, 1))
 	return out
 
@@ -3175,7 +3198,7 @@ func _update_tips(node, mat: ShaderMaterial) -> void:
 		_remove_tips(node)
 		return
 	# Reach of a tip: a few cap half widths.
-	var cs = float(mat.get_shader_param("cap_scale"))
+	var cs = max(float(mat.get_shader_param("cap_scale")), float(mat.get_shader_param("cap_scale_hip")))
 	var hw = float(mat.get_shader_param("cap_base")) * 1.15 * cs * 0.5
 	if int(mat.get_shader_param("cap_style")) == 3:
 		for k in ["cap_ridge_tex", "cap_hip_tex"]:
@@ -3662,11 +3685,13 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	# Cap Brightness -100..100 %: gamma 4 .. 0.25.
 	# (only with Cap Recolor on)
 	var rc = bool(cfg.get("cap_recolor", false))
+	mat.set_shader_param("cap_tone_on", int(cfg.get("cap_recolor_on", 2)))
 	mat.set_shader_param("cap_gamma", pow(4.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0) if rc else 1.0)
 	mat.set_shader_param("cap_hue", clamp(float(cfg.get("cap_hue", 0.0)), -180.0, 180.0) / 360.0 if rc else 0.0)
 	# Cap Saturation -100..100 %: grey .. twice as saturated.
 	mat.set_shader_param("cap_sat", 1.0 + clamp(float(cfg.get("cap_sat", 0.0)), -100.0, 100.0) / 100.0 if rc else 1.0)
 	mat.set_shader_param("cap_scale", clamp(float(cfg.get("cap_width", 100.0)), 10.0, 500.0) / 100.0)
+	mat.set_shader_param("cap_scale_hip", clamp(float(cfg.get("cap_width_hip", cfg.get("cap_width", 100.0))), 10.0, 500.0) / 100.0)
 	# Cap width from the tile rows (textures without rows: a quarter of the
 	# texture height at most).
 	var crh = float(info.get("row_h", info["h"]))
@@ -3677,6 +3702,21 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	var cstyle = int(cfg.get("cap_style", 0))
 	var pieces = _roof_pieces(mat.get_shader_param("albedo"))
 	var has_pieces = pieces.has("ridge") and pieces.has("hip")
+	if cstyle == CAP_PATH:
+		# Path Tool textures (the hip one: the ridge's when not set). Missing
+		# (pack not loaded...): back to Auto.
+		var prt = _path_tex(str(cfg.get("cap_path_ridge", "")))
+		var pht = _path_tex(str(cfg.get("cap_path_hip", "")))
+		if prt == null:
+			prt = pht
+		if pht == null:
+			pht = prt
+		if prt != null:
+			pieces = {"ridge": prt, "hip": pht}
+			has_pieces = true
+			cstyle = 3
+		else:
+			cstyle = 0
 	if cstyle == 3 and not has_pieces:
 		cstyle = 0
 	if cstyle == 0 and has_pieces:
@@ -5147,12 +5187,26 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["side_ink"] = _make_toggle(opts, "Side Lines",
 			"Draws a dark outline on every side where the texture is plainly\ncut, whatever the drawn shape: eaves when the texture has no\ncut-out edge of its own, and always the sides that are not an\neave (gable ends, the sides a moved roof top is close to).",
 			section, "side_ink")
-		c["cap_style"] = _make_option(opts, "Cap Style", ["Auto", "Turned Tiles", "Texture Band", "Roof Pieces"],
-			"Turned Tiles: one tile column of the texture turned along the\nline (half-round tiles). Texture Band: one course of the texture\nlaid along the line (slates, bricks, thatch...). Roof Pieces: the\nridge and hip strips of a Roof Tool texture. Auto picks from the\ntexture (Roof Pieces when it has them).",
+		c["cap_style"] = _make_option(opts, "Cap Style", ["Auto", "Turned Tiles", "Texture Band", "Path", "Roof Pieces"],
+			"Turned Tiles: one tile column of the texture turned along the\nline (half-round tiles). Texture Band: one course of the texture\nlaid along the line (slates, bricks, thatch...). Roof Pieces: the\nridge and hip strips of a Roof Tool texture. Path: textures of\nthe Path Tool, picked below. Auto picks from the texture (Roof\nPieces when it has them).",
 			section, "cap_style")
-		c["cap_width"] = _make_slider(opts, "Cap Width", 30.0, 300.0, "%",
-			"Width of the ridge caps (ridges are always wider than hips).",
-			section, "cap_width", icon_reset)
+		# Path before Roof Pieces in the menu (item ids: the saved values).
+		var cso0: OptionButton = c["cap_style"]["option"]
+		cso0.set_item_id(3, CAP_PATH)
+		cso0.set_item_id(4, 3)
+		var cap_reset = _make_reset(icon_reset, "Reset all the Ridge Caps settings to their defaults")
+		cap_reset.connect("pressed", self, "_on_caps_reset", [section])
+		c["cap_style"]["row"].add_child(cap_reset)
+		c["cap_path_hip"] = _make_path_pick(opts, "Hip Path", "Path Tool texture of the hip caps (Same as Ridge: the ridge's).", section, "cap_path_hip")
+		c["cap_path_ridge"] = _make_path_pick(opts, "Ridge Path", "Path Tool texture of the ridge caps (Same as Hip: the hip's).", section, "cap_path_ridge")
+		# Width: one slider, on the hips, the ridges or both (Both: they move
+		# together, keeping their ratio).
+		c["cap_width_on"] = _make_option(opts, "Width", ["Hip", "Ridge", "Both"],
+			"Which caps the slider below sizes (Both: hips and ridges move\ntogether, keeping their ratio).", section, "cap_width_on")
+		c["cap_wsl"] = _make_slider(opts, "", 30.0, 300.0, "%",
+			"Width of the caps chosen above.", section, "cap_wsl", icon_reset)
+		c["cap_wsl"]["row"].get_child(0).visible = false
+		c["cap_wvals"] = [100.0, 100.0]
 		c["cap_bright"] = _make_slider(opts, "Cap Brightness", -100.0, 100.0, "%",
 			"Brightness of the ridge caps (changes their gamma: darker\nor lighter than the roof).",
 			section, "cap_bright", icon_reset)
@@ -5180,6 +5234,8 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["cap_recolor"] = _make_toggle(opts, "Cap Recolor",
 			"Changes the brightness, hue and saturation of the ridge caps.",
 			section, "cap_recolor")
+		c["cap_recolor_on"] = _make_option(opts, "Recolor", ["Hip", "Ridge", "Both"],
+			"Which caps Cap Recolor changes.", section, "cap_recolor_on")
 		c["corners_cog"] = _make_cog(section, "Cap Corners settings: length.")
 		c["cap_corners"]["row"].add_child(c["corners_cog"])
 		c["ridge_cog"] = _make_cog(section, "Ridge Ends settings: fade.")
@@ -5190,7 +5246,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["seams_cog"] = _make_cog(section, "Ridge Caps settings: style, width, brightness and outline.")
 		c["seams"]["row"].add_child(c["seams_cog"])
 		c["cap_box"] = _make_box(opts, c["seams"]["row"].get_index() + 1,
-			[c["cap_style"]["row"], c["cap_width"]["row"], c["cap_outline"]["row"], c["cap_corners"]["row"], c["cap_tip"]["row"], c["ridge_ends"]["row"], c["cap_fade"]["row"], c["cap_recolor"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_sep"]])
+			[c["cap_style"]["row"], c["cap_path_hip"]["row"], c["cap_path_ridge"]["row"], c["cap_width_on"]["row"], c["cap_wsl"]["row"], c["cap_outline"]["row"], c["cap_corners"]["row"], c["cap_tip"]["row"], c["ridge_ends"]["row"], c["cap_fade"]["row"], c["cap_recolor"], c["cap_recolor_on"]["row"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_sep"]])
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
@@ -5418,11 +5474,43 @@ func _on_merge_cog(_pressed: bool, section: String) -> void:
 func _on_option_selected(index: int, section: String, field: String) -> void:
 	if _updating_ui:
 		return
+	if field == "cap_style":
+		# (its items are not in the order of their values)
+		var cc = _ui.get(section)
+		if cc != null and cc.has("cap_style"):
+			index = cc["cap_style"]["option"].get_item_id(index)
 	if section == "tool":
 		_tool_cfg[field] = index
 		_update_visibility(section)
 		return
 	_apply_fields(section, {field: index})
+	_update_visibility(section)
+	if field == "cap_width_on":
+		_wsl_show(section)
+	# Path picked without a texture yet: the picker opens.
+	var c = _ui.get(section)
+	if field == "cap_style" and index == CAP_PATH and c != null and c.has("cap_path_ridge") and c["cap_path_ridge"]["path"] == "" and c["cap_path_hip"]["path"] == "":
+		_open_path_pop(section, "cap_path_ridge")
+
+
+const CAP_KEYS = ["cap_style", "cap_path_ridge", "cap_path_hip", "cap_width", "cap_width_hip", "cap_width_on",
+	"cap_outline", "cap_corners", "cap_tip", "ridge_ends", "cap_fade", "cap_recolor", "cap_recolor_on",
+	"cap_bright", "cap_hue", "cap_sat"]
+
+# Reset button beside Cap Style: every Ridge Caps setting back to default.
+func _on_caps_reset(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null or section != "select":
+		return
+	var fields = {}
+	for k in CAP_KEYS:
+		fields[k] = DEFAULT_CFG[k]
+	_apply_fields(section, fields)
+	var store = _get_store()
+	if store != null and not _sel_shapes.empty():
+		var key = _key_of(_sel_shapes[0])
+		if key != "" and store.has(key):
+			_set_ui_values("select", store[key], true)
 	_update_visibility(section)
 
 
@@ -5716,15 +5804,20 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		c["shade_on"].pressed = full["shade_on"]
 		c["side_ink"].pressed = full["side_ink"]
 		c["cap_outline"]["option"].select(full["cap_outline"])
-		_set_ctl(c["cap_width"], full["cap_width"])
+		c["cap_wvals"] = [full["cap_width_hip"], full["cap_width"]]
+		c["cap_width_on"]["option"].select(full["cap_width_on"])
+		_wsl_show(section)
 		_set_ctl(c["cap_bright"], full["cap_bright"])
 		_set_ctl(c["cap_hue"], full["cap_hue"])
 		_set_ctl(c["cap_sat"], full["cap_sat"])
-		c["cap_style"]["option"].select(full["cap_style"])
+		c["cap_style"]["option"].select(c["cap_style"]["option"].get_item_index(full["cap_style"]))
+		_set_path_pick(c["cap_path_ridge"], full["cap_path_ridge"], false)
+		_set_path_pick(c["cap_path_hip"], full["cap_path_hip"], true)
 		c["cap_corners"]["option"].select(full["cap_corners"])
 		_set_ctl(c["cap_tip"], full["cap_tip"])
 		c["ridge_ends"]["option"].select(full["ridge_ends"])
 		c["cap_recolor"].pressed = full["cap_recolor"]
+		c["cap_recolor_on"]["option"].select(full["cap_recolor_on"])
 		_set_ctl(c["cap_fade"], full["cap_fade"])
 		c["apex_x"].value = round(full["apex_x"] * 100.0)
 		c["apex_y"].value = round(full["apex_y"] * 100.0)
@@ -5774,15 +5867,20 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		cfg["merge"] = c["merge"].pressed
 		cfg["side_ink"] = c["side_ink"].pressed
 		cfg["cap_outline"] = c["cap_outline"]["option"].selected
-		cfg["cap_width"] = float(c["cap_width"]["spin"].value)
+		cfg["cap_width"] = float(c["cap_wvals"][1])
+		cfg["cap_width_hip"] = float(c["cap_wvals"][0])
+		cfg["cap_width_on"] = c["cap_width_on"]["option"].selected
 		cfg["cap_bright"] = float(c["cap_bright"]["spin"].value)
 		cfg["cap_hue"] = float(c["cap_hue"]["spin"].value)
 		cfg["cap_sat"] = float(c["cap_sat"]["spin"].value)
-		cfg["cap_style"] = c["cap_style"]["option"].selected
+		cfg["cap_style"] = c["cap_style"]["option"].get_selected_id()
+		cfg["cap_path_ridge"] = c["cap_path_ridge"]["path"]
+		cfg["cap_path_hip"] = c["cap_path_hip"]["path"]
 		cfg["cap_corners"] = c["cap_corners"]["option"].selected
 		cfg["cap_tip"] = float(c["cap_tip"]["spin"].value)
 		cfg["ridge_ends"] = c["ridge_ends"]["option"].selected
 		cfg["cap_recolor"] = c["cap_recolor"].pressed
+		cfg["cap_recolor_on"] = c["cap_recolor_on"]["option"].selected
 		cfg["cap_fade"] = float(c["cap_fade"]["spin"].value)
 		cfg["apex_x"] = float(c["apex_x"].value) / 100.0
 		cfg["apex_y"] = float(c["apex_y"].value) / 100.0
@@ -5813,8 +5911,8 @@ func _update_visibility(section: String) -> void:
 				pieces_ok = false
 				break
 		var cso = c["cap_style"]["option"]
-		cso.set_item_disabled(3, not pieces_ok)
-		if not pieces_ok and cso.selected == 3:
+		cso.set_item_disabled(cso.get_item_index(3), not pieces_ok)
+		if not pieces_ok and cso.get_selected_id() == 3:
 			cso.select(0)
 			if not _updating_ui:
 				_apply_fields(section, {"cap_style": 0})
@@ -5843,8 +5941,16 @@ func _update_visibility(section: String) -> void:
 	c["ridge_cog"].modulate = Color(1, 1, 1, 1) if mitred else Color(1, 1, 1, 0.35)
 	c["cap_fade"]["row"].visible = mitred and c["ridge_cog"].pressed
 	c["cap_tip"]["row"].visible = c["corners_cog"].pressed
+	var path_on = c["cap_style"]["option"].get_selected_id() == CAP_PATH
+	# Gap Free (Two Slopes): a ridge, no hips.
+	var hips = mode != MODE_FILL
+	c["cap_path_ridge"]["row"].visible = path_on
+	c["cap_path_hip"]["row"].visible = path_on and hips
+	c["cap_width_on"]["row"].visible = hips
 	for k in ["cap_bright", "cap_hue", "cap_sat"]:
 		c[k]["row"].visible = c["cap_recolor"].pressed
+	# (Gap Free: a ridge only)
+	c["cap_recolor_on"]["row"].visible = c["cap_recolor"].pressed and mode != MODE_FILL
 	c["tex_box"].visible = c["tex_cog"].pressed
 	c["shade_on"].visible = shaded
 	c["shade_sep"].visible = shaded
@@ -5854,6 +5960,218 @@ func _update_visibility(section: String) -> void:
 	c["light"]["row"].visible = shaded and c["shade_on"].pressed
 	c["apex_on"].visible = mode == MODE_CENTER
 	c["apex_box"].visible = mode == MODE_CENTER and c["apex_on"].pressed
+
+
+# ── Cap Style Path: Path Tool textures ──
+
+# Path Tool textures seen in its list (path -> texture): kept, so a search in
+# the Path Tool does not hide any from the picker.
+var _paths_seen = {}
+var _path_pop = null
+var _path_pop_list = null
+var _path_pop_search = null
+var _path_pop_target = []
+var _path_pop_same = null
+
+
+func _path_items() -> Array:
+	var grid = _grid_menu("PathTool", false)
+	if grid != null:
+		for i in range(grid.get_item_count()):
+			var m = grid.get_item_metadata(i)
+			var ic = grid.get_item_icon(i)
+			if m is String and m != "" and ic is Texture:
+				_paths_seen[m] = ic
+	var out = _paths_seen.keys()
+	out.sort_custom(self, "_path_name_less")
+	return out
+
+
+func _path_name_less(a, b) -> bool:
+	return _path_name(a).nocasecmp_to(_path_name(b)) < 0
+
+
+func _path_name(path: String) -> String:
+	return path.get_file().get_basename().capitalize()
+
+
+# The texture of a Path Tool asset (DD's own when it has it: tiled, as paths
+# need).
+func _path_tex(path: String):
+	if path == "" or path == PATH_SAME_HIP:
+		return null
+	if not _paths_seen.has(path):
+		_path_items()
+	var t = _paths_seen.get(path)
+	if t is Texture and (t.flags & Texture.FLAG_REPEAT) != 0 and t.resource_path == path:
+		return t
+	return _load_asset_tex(path, true)
+
+
+func _make_path_pick(parent: Node, text: String, tip: String, section: String, field: String) -> Dictionary:
+	var row = HBoxContainer.new()
+	parent.add_child(row)
+	var lbl = Label.new()
+	lbl.text = text
+	lbl.hint_tooltip = tip
+	lbl.mouse_filter = Control.MOUSE_FILTER_PASS
+	row.add_child(lbl)
+	var b = Button.new()
+	b.focus_mode = Control.FOCUS_NONE
+	b.hint_tooltip = tip
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.clip_text = true
+	b.align = Button.ALIGN_LEFT
+	b.connect("pressed", self, "_open_path_pop", [section, field])
+	# A framed box: clearly something to click.
+	for st in [["normal", 0.06, 0.28], ["hover", 0.14, 0.5], ["pressed", 0.2, 0.6], ["focus", 0.06, 0.28], ["disabled", 0.03, 0.15]]:
+		var sb = StyleBoxFlat.new()
+		sb.bg_color = Color(1, 1, 1, st[1])
+		sb.border_color = Color(1, 1, 1, st[2])
+		sb.set_border_width_all(1)
+		sb.set_corner_radius_all(3)
+		sb.content_margin_left = 6
+		sb.content_margin_right = 6
+		sb.content_margin_top = 3
+		sb.content_margin_bottom = 3
+		b.add_stylebox_override(st[0], sb)
+	row.add_child(b)
+	return {"row": row, "button": b, "path": ""}
+
+
+func _set_path_pick(pick: Dictionary, path: String, hip: bool) -> void:
+	pick["path"] = path
+	var b: Button = pick["button"]
+	if path == "" or path == PATH_SAME_HIP:
+		b.text = "Same as Ridge" if hip else ("Same as Hip" if path == PATH_SAME_HIP else "Choose...")
+		b.icon = null
+	else:
+		b.text = _path_name(path)
+		var t = _paths_seen.get(path)
+		if t == null:
+			t = _path_tex(path)
+		b.icon = _path_thumb(t)
+	b.hint_tooltip = path if path != "" else b.text
+
+
+# Small preview of a path texture for the button (its middle, 72 x 18).
+var _thumb_cache = {}
+
+func _path_thumb(t):
+	if not (t is Texture) or t.get_height() <= 0:
+		return null
+	var id = t.get_instance_id()
+	if _thumb_cache.has(id):
+		return _thumb_cache[id]
+	var out = null
+	var img = t.get_data()
+	if img != null and not img.is_empty():
+		img = img.duplicate()
+		if img.is_compressed():
+			img.decompress()
+		var h = img.get_height()
+		var w = min(img.get_width(), h * 4)
+		img = img.get_rect(Rect2(0, 0, w, h))
+		img.resize(int(max(18.0 * w / h, 1.0)), 18, Image.INTERPOLATE_LANCZOS)
+		out = ImageTexture.new()
+		out.create_from_image(img, Texture.FLAG_FILTER)
+	_thumb_cache[id] = out
+	return out
+
+
+func _open_path_pop(section: String, field: String) -> void:
+	var c = _ui.get(section)
+	if c == null:
+		return
+	if _path_pop == null or not is_instance_valid(_path_pop):
+		_path_pop = WindowDialog.new()
+		_path_pop.window_title = "Choose a Path"
+		_path_pop.resizable = true
+		var vb = VBoxContainer.new()
+		vb.anchor_right = 1.0
+		vb.anchor_bottom = 1.0
+		vb.margin_left = 8
+		vb.margin_top = 8
+		vb.margin_right = -8
+		vb.margin_bottom = -8
+		_path_pop.add_child(vb)
+		_path_pop_search = LineEdit.new()
+		_path_pop_search.placeholder_text = "Search..."
+		_path_pop_search.clear_button_enabled = true
+		_path_pop_search.connect("text_changed", self, "_fill_path_pop")
+		_path_pop_search.connect("focus_entered", self, "_on_text_focus", [true])
+		_path_pop_search.connect("focus_exited", self, "_on_text_focus", [false])
+		vb.add_child(_path_pop_search)
+		# Same as Ridge / Same as Hip: out of the list, always in view.
+		_path_pop_same = Button.new()
+		_path_pop_same.focus_mode = Control.FOCUS_NONE
+		_path_pop_same.connect("pressed", self, "_on_path_pop_same")
+		vb.add_child(_path_pop_same)
+		_path_pop_list = ItemList.new()
+		_path_pop_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		_path_pop_list.max_columns = 1
+		_path_pop_list.fixed_icon_size = Vector2(256, 40)
+		_path_pop_list.icon_mode = ItemList.ICON_MODE_LEFT
+		_path_pop_list.connect("item_selected", self, "_on_path_pop_pick")
+		vb.add_child(_path_pop_list)
+		_path_pop.connect("popup_hide", self, "_on_text_focus", [false])
+		# Under the Roof Builder section: DD's theme.
+		c["root"].add_child(_path_pop)
+	_path_pop_target = [section, field]
+	# (the search is kept from one opening to the next)
+	_fill_path_pop(_path_pop_search.text)
+	_path_pop.popup_centered(Vector2(460, 560))
+	_path_pop_search.grab_focus()
+
+
+func _fill_path_pop(text: String) -> void:
+	_path_pop_list.clear()
+	var hip = _path_pop_target.size() > 1 and _path_pop_target[1] == "cap_path_hip"
+	var terms = []
+	for t in text.to_lower().split(" ", false):
+		terms.append(t)
+	# Always on top: Same as Ridge (Hip Path), Same as Hip (Ridge Path, once
+	# the Hip Path is set, on roofs with hips).
+	var c = _ui.get(_path_pop_target[0]) if not _path_pop_target.empty() else null
+	if hip:
+		_path_pop_same.text = "Same as Ridge"
+		_path_pop_same.visible = true
+	else:
+		_path_pop_same.text = "Same as Hip"
+		_path_pop_same.visible = c != null and c["cap_path_hip"]["path"] != "" and _ui_mode(_path_pop_target[0]) != MODE_FILL
+	for path in _path_items():
+		var name = _path_name(path)
+		var key = path.to_lower()
+		var ok = true
+		for t in terms:
+			if key.find(t) < 0:
+				ok = false
+				break
+		if not ok:
+			continue
+		_path_pop_list.add_item(name, _paths_seen.get(path))
+		var i = _path_pop_list.get_item_count() - 1
+		_path_pop_list.set_item_metadata(i, path)
+		_path_pop_list.set_item_tooltip(i, path)
+
+
+func _on_path_pop_same() -> void:
+	_path_pop_apply("" if _path_pop_target[1] == "cap_path_hip" else PATH_SAME_HIP)
+
+
+func _on_path_pop_pick(index: int) -> void:
+	_path_pop_apply(str(_path_pop_list.get_item_metadata(index)))
+
+
+func _path_pop_apply(path: String) -> void:
+	var section = _path_pop_target[0]
+	var field = _path_pop_target[1]
+	_path_pop.hide()
+	var c = _ui.get(section)
+	if c == null:
+		return
+	_set_path_pick(c[field], path, field == "cap_path_hip")
+	_apply_fields(section, {field: path})
 
 
 func _on_text_focus(on: bool) -> void:
@@ -5962,6 +6280,25 @@ func _on_value_changed(value: float, section: String, field: String, source: Str
 func _linked(section: String, field: String, v: float) -> Dictionary:
 	var out = {field: v}
 	var c = _ui.get(section)
+	if field == "cap_wsl":
+		# Width slider: Hip, Ridge or Both (ratio kept); Gap Free: ridge.
+		out = {}
+		var on = _wsl_on(section)
+		var vals = c["cap_wvals"] if c != null and c.has("cap_wvals") else [v, v]
+		if on == 0:
+			vals[0] = v
+		elif on == 1:
+			vals[1] = v
+		else:
+			var k = vals[0] / max(vals[1], 1.0)
+			vals[1] = v
+			vals[0] = clamp(v * k, 30.0, 300.0)
+		# (only the widths the slider sizes)
+		if on != 1:
+			out["cap_width_hip"] = vals[0]
+		if on != 0:
+			out["cap_width"] = vals[1]
+		return out
 	if c == null or not c.has("links") or not c["links"][0].pressed or not (field == "scale" or field == "pitch"):
 		return out
 	_updating_ui = true
@@ -5985,6 +6322,25 @@ func _link_take(section: String) -> void:
 	_link_k = float(c["scale"]["spin"].value) / max(cos(deg2rad(float(c["pitch"]["spin"].value))), 0.05)
 
 
+# Which caps the Width slider sizes (Gap Free: the ridge).
+func _wsl_on(section: String) -> int:
+	var c = _ui.get(section)
+	if c == null or not c.has("cap_width_on") or _ui_mode(section) == MODE_FILL:
+		return 1
+	return c["cap_width_on"]["option"].selected
+
+
+# Width slider: shows the hips' width (Hip) or the ridges' (Ridge, Both).
+func _wsl_show(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null or not c.has("cap_wsl"):
+		return
+	var was = _updating_ui
+	_updating_ui = true
+	_set_ctl(c["cap_wsl"], c["cap_wvals"][0] if _wsl_on(section) == 0 else c["cap_wvals"][1])
+	_updating_ui = was
+
+
 func _on_link_toggled(pressed: bool, section: String) -> void:
 	var c = _ui.get(section)
 	if c == null:
@@ -6002,7 +6358,7 @@ func _on_reset_pressed(section: String, field: String) -> void:
 	var c = _ui.get(section)
 	if c == null or not c.has(field):
 		return
-	var v = float(DEFAULT_CFG[field])
+	var v = float(DEFAULT_CFG.get(field, 100.0))
 	_updating_ui = true
 	_set_ctl(c[field], v * 100.0 if field == "shade" else v)
 	_updating_ui = false
@@ -6548,7 +6904,7 @@ const LIB_MARK = "\n(Roof Tool)"
 
 # The texture lists (GridMenu) of a tool panel; patterns: only those listing
 # pattern textures.
-const LIB_CONTROLS = {"PatternShapeTool": "Texture", "SelectTool": "PatternTexture", "RoofTool": "Texture"}
+const LIB_CONTROLS = {"PatternShapeTool": "Texture", "SelectTool": "PatternTexture", "RoofTool": "Texture", "PathTool": "Texture"}
 
 
 func _grid_menus(tool_name: String, patterns: bool) -> Array:

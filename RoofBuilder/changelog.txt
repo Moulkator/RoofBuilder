@@ -1,5 +1,13 @@
 ROOF BUILDER
 
+1.2.2
+NEW:
+- Added Path Cap Style: Path Tool textures as Ridge Caps, one for the hips and one for the ridges (or the same for both), picked in a window with a search bar
+- Added Width menu (Hip / Ridge / Both) for the Cap Width slider: hips and ridges can have their own width
+- Added Recolor menu (Hip / Ridge / Both) in Cap Recolor
+- Added a Reset button next to Cap Style: all the Ridge Caps settings back to their defaults
+
+
 1.2.1
 NEW:
 - Added Cap Corners Style (Square / Round / Flat) and Cap Corners Length: hips end in a point, a half circle or a flat cut at the shape's corners, past the outline or short of it
