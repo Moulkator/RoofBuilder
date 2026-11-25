@@ -1,5 +1,21 @@
 ROOF BUILDER
 
+1.3.0
+NEW:
+- Added Flat Roof (Hip, Centered, Gap Free with Two Slopes): flat top with Flat Texture (roof texture or a pattern picked in a window with a search bar), Flat Size, Flat Rotation and Flat Scale. With Seams on Ridge Caps, a ridge runs all around it
+- Added Recolor for the whole roof: Brightness / Hue / Saturation per part (Tiles, Hip, Ridge, Flat Part), with a Part menu (All Roof has its own values, added to each part's; Hip & Ridge changes both; a star marks the changed parts). The flat part is a little brighter and greyer by default
+
+CHANGED:
+- Cap Recolor replaced by Recolor (older roofs keep their cap colours).
+- Improved the Roof Builder section: framed while ON, settings in framed groups (Shape, Seams, Flat Roof, Merge, Shading, Texture Settings, Recolor), Recolor at the bottom.
+- Added cog buttons to Shading, Flat Roof, Recolor and Custom Top Position: their settings show or hide (they open when the switch is turned on).
+- Added Reset buttons next to the Recolor and Texture Settings cogs.
+- Added a cog next to Roof Builder in the Select Tool: folds its settings away.
+
+FIXED:
+- Fixed menus and picker windows opened over the pattern list: with Auto Roof Library, the list took their clicks
+
+
 1.2.2
 NEW:
 - Added Path Cap Style: Path Tool textures as Ridge Caps, one for the hips and one for the ridges (or the same for both), picked in a window with a search bar

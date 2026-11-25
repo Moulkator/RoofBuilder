@@ -60,6 +60,21 @@ const SEAMS_NONE = 0
 const SEAMS_LINE = 1
 const SEAMS_SOFT = 2
 const SEAMS_CAPS = 3
+# Recolor: the parts its sliders change (menu), and their settings.
+const RC_ALL = 0
+const RC_TILES = 1
+const RC_CAPS = 2
+const RC_HIP = 3
+const RC_RIDGE = 4
+const RC_FLAT = 5
+# (All Roof: its own values, added to each part's)
+const RC_PARTS = [["all"], ["tile"], ["hip", "ridge"], ["hip"], ["ridge"], ["flat"]]
+const RC_KEYS = ["all_bright", "all_hue", "all_sat", "tile_bright", "tile_hue", "tile_sat", "hip_bright", "hip_hue", "hip_sat",
+	"ridge_bright", "ridge_hue", "ridge_sat", "flat_bright", "flat_hue", "flat_sat"]
+# Settings of a slider standing for others (see _linked): reset values.
+# Reset buttons: neutral values where they differ from the defaults.
+const RESET_VALUES = {"flat_rot": 0.0, "flat_scale": 100.0}
+const VIRTUAL_DEFAULTS = {"cap_wsl": 100.0, "rc_bright": 0.0, "rc_hue": 0.0, "rc_sat": 0.0}
 # Cap Style Path: Path Tool textures as ridge / hip caps.
 const CAP_PATH = 4
 # Ridge Path "Same as Hip".
@@ -115,11 +130,30 @@ const DEFAULT_CFG = {
 	"cap_path_ridge": "",
 	"cap_path_hip": "",
 	"cap_outline": 1,
-	"cap_bright": 0.0,
-	"cap_hue": 0.0,
-	"cap_sat": 0.0,
-	"cap_recolor": false,
-	"cap_recolor_on": 2,
+	"flat_on": false,
+	"flat_size": 50.0,
+	"flat_src": 0,
+	"flat_pattern": "",
+	"flat_rot": 45.0,
+	"flat_scale": 50.0,
+	# (on: the flat part's own recolor below)
+	"recolor": true,
+	"recolor_on": 0,
+	"all_bright": 0.0,
+	"all_hue": 0.0,
+	"all_sat": 0.0,
+	"tile_bright": 0.0,
+	"tile_hue": 0.0,
+	"tile_sat": 0.0,
+	"hip_bright": 0.0,
+	"hip_hue": 0.0,
+	"hip_sat": 0.0,
+	"ridge_bright": 0.0,
+	"ridge_hue": 0.0,
+	"ridge_sat": 0.0,
+	"flat_bright": 10.0,
+	"flat_hue": 0.0,
+	"flat_sat": -20.0,
 	"cap_corners": 1,
 	"cap_tip": 35.0,
 	"ridge_ends": 0,
@@ -202,7 +236,6 @@ uniform bool mirror = false;
 uniform bool ridge_caps = false;
 uniform float cap_scale = 1.0;
 uniform float cap_scale_hip = 1.0;
-uniform int cap_tone_on = 2;
 // 1 = tiles (one tile column turned along the line, for half-round tiles),
 // 2 = band (one course of the texture laid along the line), 3 = the roof's
 // own ridge / hip strips (Roof Tool assets).
@@ -223,11 +256,25 @@ uniform float cap_base = 64.0;
 uniform int cap_ends = 0;
 // Ridge Caps outline: 0 none, 1 ink line, 2 blurred (fades out at its edges).
 uniform int cap_outline = 1;
-// Cap Brightness: gamma applied to the cap texture (< 1 brighter).
-uniform float cap_gamma = 1.0;
-// Cap Hue (turns, -0.5..0.5) and Cap Saturation (factor).
-uniform float cap_hue = 0.0;
-uniform float cap_sat = 1.0;
+// Recolor, per part (tiles, hips, ridges, flat part): gamma (< 1 brighter),
+// hue shift (turns, -0.5..0.5), saturation factor.
+uniform vec3 tone_tile = vec3(1.0, 0.0, 1.0);
+uniform vec3 tone_hip = vec3(1.0, 0.0, 1.0);
+uniform vec3 tone_ridge = vec3(1.0, 0.0, 1.0);
+uniform vec3 tone_flat = vec3(1.0, 0.0, 1.0);
+// Flat Roof: the top of the roof (flat_frac of the way from the top down
+// to the eave) is flat, with its own texture laid flat over it.
+uniform bool flat_on = false;
+uniform float flat_frac = 0.4;
+// Height of the top (local units, before Pitch): Gap Free and Hip roofs.
+uniform float flat_hmax = 100.0;
+// Texture of the flat part: 0 the roof's own (its repeated rows), 1 flat_tex.
+uniform int flat_src = 0;
+uniform sampler2D flat_tex;
+uniform float flat_rot = 0.0;
+uniform float flat_scale = 1.0;
+// A ridge (cap, with the Ridge Caps settings) all around the flat part.
+uniform bool flat_edge = false;
 // Centered roofs: curved slope (Profile). profile_lut, at x = share of the
 // way up as a cone (0 eave, 1 top): r = share of the way up along the curved
 // slope, g = how much it slopes (shading, 1 = cone), b = inverse of r.
@@ -463,7 +510,9 @@ float merge_height(vec2 v, int pi)
 		{
 			return -1.0;
 		}
-		return (1.0 - rc / rrc) * p3.x * p3.y - p0.w;
+		float hcs = (1.0 - rc / rrc) * p3.x * p3.y;
+		float fcs = texelFetch(merge_data, ivec2(6, r0), 0).x;
+		return (fcs >= 0.0 ? min(hcs, fcs) : hcs) - p0.w;
 	}
 	bool inside = false;
 	float d_edge = 100000000.0;
@@ -539,6 +588,12 @@ float merge_height(vec2 v, int pi)
 		float rr = max(mix(ra, rb, fr), 0.001);
 		hm = max(1.0 - r / rr, 0.0) * p3.x * p3.y;
 	}
+	// Flat Roof: its flat top.
+	float fct = texelFetch(merge_data, ivec2(6, r0), 0).x;
+	if (fct >= 0.0)
+	{
+		hm = min(hm, fct);
+	}
 	return hm - p0.w;
 }
 
@@ -572,9 +627,24 @@ bool in_shape(vec2 p)
 	return inside;
 }
 
+// Flat Roof: height of the flat top (same scale as own_height).
+float flat_top_h()
+{
+	if (!flat_on)
+	{
+		return 100000000.0;
+	}
+	if (roof_mode == 2)
+	{
+		return (1.0 - flat_frac) * max(ref_d, 0.001) * pitch_scale;
+	}
+	return (1.0 - flat_frac) * flat_hmax * pitch_scale;
+}
+
 // This roof's own height at p (local), the same value as in fragment(), for
-// tests away from the pixel. -1 outside the shape.
-float own_height(vec2 p)
+// tests away from the pixel (without the flat top, see own_height). -1
+// outside the shape.
+float own_height_raw(vec2 p)
 {
 	if (roof_mode == 2)
 	{
@@ -675,6 +745,13 @@ float own_height(vec2 p)
 		t = min(t, (base.y - v_min) * size.y);
 	}
 	return t * pitch_scale;
+}
+
+// own_height_raw with the flat top (Flat Roof).
+float own_height(vec2 p)
+{
+	float h = own_height_raw(p);
+	return h < 0.0 ? h : min(h, flat_top_h());
 }
 
 // Is this roof really drawn at p? (inside the shape, above its visible eave,
@@ -1001,6 +1078,43 @@ vec4 ct_edge_blur(vec4 color, vec2 v)
 	return color;
 }
 
+// Colour of a roof texture sample o with the pattern colour col (Colour and
+// Modify Things, colourable textures, wear), rgb + alpha.
+vec4 base_colour(vec4 o, vec4 col, vec2 v)
+{
+	vec3 tx = o.rgb * col.rgb;
+	float a = col.a * o.a;
+	if (ct_on)
+	{
+		// Colour and Modify Things: its colour steps replace the pattern
+		// colour (COLOR); its tint and opacity come with the modulate.
+		vec4 cc = o;
+		if (ct_has_edge_blur)
+		{
+			cc = ct_edge_blur(cc, v);
+		}
+		cc = ct_colour(cc);
+		tx = cc.rgb;
+		a = cc.a;
+	}
+	else if (custom_color)
+	{
+		tx = o.rgb;
+		float redness = o.r - (o.g + o.b) * 0.5;
+		if (redness > 0.0)
+		{
+			float intensity = smoothstep(0.0, 0.5, redness);
+			tx = mix(o.rgb, col.rgb * o.r, intensity);
+		}
+	}
+	if (use_wear)
+	{
+		vec2 wear_size = vec2(textureSize(wear, 0)) * 2.0;
+		tx *= texture(wear, v / wear_size).rgb;
+	}
+	return vec4(tx, a);
+}
+
 // Ridge Caps: one cap piece. a: along the cap (texels, from where its tiles
 // start), sx: across the cap (-1..1 on its sides), et:
 // past its end (0..1 on the rounded end, along end_dir), hw: half width.
@@ -1014,25 +1128,30 @@ float shade_light(vec2 n)
 	return max(1.0 + shade * k * d, 0.0);
 }
 
-// Half width of a cap (ridge or hip), in local pixels.
-// Cap Brightness, Hue and Saturation (on the hips, the ridges or both:
-// cap_tone_on 0 / 1 / 2).
-vec3 cap_tone(vec3 c, bool is_ridge)
+// Recolor: brightness (gamma), hue and saturation of k (see tone_tile).
+vec3 tone3(vec3 c, vec3 k)
 {
-	if ((cap_tone_on == 0 && is_ridge) || (cap_tone_on == 1 && !is_ridge))
+	if (abs(k.x - 1.0) > 0.0001)
 	{
-		return c;
+		c = pow(max(c, vec3(0.0)), vec3(k.x));
 	}
-	c = pow(max(c, vec3(0.0)), vec3(cap_gamma));
-	if (abs(cap_hue) > 0.0001 || abs(cap_sat - 1.0) > 0.0001)
+	if (abs(k.y) > 0.0001 || abs(k.z - 1.0) > 0.0001)
 	{
 		vec3 hsv = ct_rgb2hsv(c);
-		hsv.x = fract(hsv.x + cap_hue);
-		hsv.y = clamp(hsv.y * cap_sat, 0.0, 1.0);
+		hsv.x = fract(hsv.x + k.y);
+		hsv.y = clamp(hsv.y * k.z, 0.0, 1.0);
 		c = ct_hsv2rgb(hsv);
 	}
 	return c;
 }
+
+// Recolor of the caps: the ridges' or the hips'.
+vec3 cap_tone(vec3 c, bool is_ridge)
+{
+	return tone3(c, is_ridge ? tone_ridge : tone_hip);
+}
+
+// Half width of a cap (ridge or hip), in local pixels.
 
 float cap_hw(bool is_ridge, float cosn)
 {
@@ -1540,6 +1659,11 @@ void cap_keep(vec4 c, float r, inout vec4 c1, inout float r1, inout vec4 c2, ino
 // tip_mode: the caps' tips past the outline's corners, outside the shape.
 vec4 cap_tip_mode(vec2 v, vec4 tint, float cpx)
 {
+	if (flat_on && flat_frac >= 0.999)
+	{
+		// (all flat: no caps)
+		return vec4(0.0);
+	}
 	vec2 size = vec2(textureSize(albedo, 0));
 	vec4 c_1 = vec4(0.0);
 	vec4 c_2 = vec4(0.0);
@@ -1630,6 +1754,11 @@ void fragment()
 	bool in_round = false;
 	float round_keep = 1.0;
 	float round_rim = 0.0;
+	// Flat Roof: signed distance to the edge of the flat part (local units,
+	// > 0 on it).
+	float flat_d = -100000000.0;
+	// Position along the edge of the flat part (local units), for its ridge.
+	float flat_a = 0.0;
 	if (roof_mode == 2)
 	{
 		vec2 p = v_local - center;
@@ -1649,6 +1778,7 @@ void fragment()
 		if (p1 < a0.z - 0.5) { p1 += 1.0; }
 		else if (p1 > a0.z + 0.5) { p1 -= 1.0; }
 		float per = fract(mix(a0.z, p1, fr));
+		flat_a = per * perimeter * flat_frac;
 		if (abs(a0.x - a1.x) > 0.08 * max(a0.x, a1.x))
 		{
 			// The outline jumps between two samples (a corner seen edge-on
@@ -1668,6 +1798,8 @@ void fragment()
 			face_n = length(nn) > 0.0001 ? normalize(nn) : rd;
 		}
 		float s = clamp(r / rr, 0.0, 1.0);
+		// Flat part: the outline shrunk toward the top, flat_frac of it.
+		flat_d = flat_frac * rr - r;
 		// Rows follow the outline shrunk toward the top (level courses of a
 		// cone): same number of rows in every direction, closer together on
 		// the steep side when the top point is moved.
@@ -1882,6 +2014,7 @@ void fragment()
 		t = best * pitch_scale;
 		h_own = t;
 		ux = dot(v_local - e0.xy, xa) / (size.x * tex_scale);
+		flat_a = dot(v_local - e0.xy, xa);
 		if (seam_soft > 0.0)
 		{
 			vec4 e2 = texelFetch(edges, ivec2(bi2, 0), 0);
@@ -1911,6 +2044,7 @@ void fragment()
 		t = (v_max - base.y) * size.y * pitch_scale;
 		ux = base.x;
 		face_n = normalize(vec2(-sin(rotation) / size.x, cos(rotation) / size.y));
+		flat_a = dot(v_local, vec2(-face_n.y, face_n.x));
 		if (mirror)
 		{
 			// Far slope = near slope turned 180° (+ ridge offset).
@@ -1997,6 +2131,11 @@ void fragment()
 		}
 		h_own = t;
 	}
+	if (flat_on && roof_mode != 2)
+	{
+		// Flat part: where the roof rises past (1 - flat_frac) of its top.
+		flat_d = h_own / max(pitch_scale, 0.0001) - (1.0 - flat_frac) * flat_hmax;
+	}
 	vec4 original = roof_sample(ux, t, lod, size);
 	if (w2 > 0.0)
 	{
@@ -2008,36 +2147,9 @@ void fragment()
 		original.rgb = mix(original.rgb, other.rgb, wb);
 		w2 = wb;
 	}
-	vec3 texel = original.rgb * COLOR.rgb;
-	float alpha = COLOR.a * original.a;
-	if (ct_on)
-	{
-		// Colour and Modify Things: its colour steps replace the pattern
-		// colour (COLOR); its tint and opacity come with the modulate.
-		vec4 cc = original;
-		if (ct_has_edge_blur)
-		{
-			cc = ct_edge_blur(cc, v_local);
-		}
-		cc = ct_colour(cc);
-		texel = cc.rgb;
-		alpha = cc.a;
-	}
-	else if (custom_color)
-	{
-		texel = original.rgb;
-		float redness = original.r - (original.g + original.b) * 0.5;
-		if (redness > 0.0)
-		{
-			float intensity = smoothstep(0.0, 0.5, redness);
-			texel = mix(original.rgb, COLOR.rgb * original.r, intensity);
-		}
-	}
-	if (use_wear)
-	{
-		vec2 wear_size = vec2(textureSize(wear, 0)) * 2.0;
-		texel *= texture(wear, v_local / wear_size).rgb;
-	}
+	vec4 bcol = base_colour(original, COLOR, v_local);
+	vec3 texel = tone3(bcol.rgb, tone_tile);
+	float alpha = bcol.a;
 	if (shade > 0.0 && (roof_mode != 1 || mirror))
 	{
 		// Light of each face, blended across soft seams (the normals of two
@@ -2364,6 +2476,105 @@ void fragment()
 			texel *= mix(1.0, 0.12, (1.0 - smoothstep(c_ink * 0.5, c_ink, de_min)) * max(cap_a - tip_k, 0.0));
 		}
 	}
+	if (flat_on)
+	{
+		float fpx = max(max(length(dx), length(dy)), 0.000001);
+		float f_cov = clamp(flat_d / fpx + 0.5, 0.0, 1.0);
+		if (f_cov > 0.0)
+		{
+			// Flat part: its own texture laid flat (not shaded), over the
+			// slopes and their caps.
+			float fa = rotation + flat_rot;
+			vec2 fp = vec2(cos(fa) * v_local.x + sin(fa) * v_local.y, cos(fa) * v_local.y - sin(fa) * v_local.x);
+			vec4 fc;
+			if (flat_src == 1)
+			{
+				vec2 fts = vec2(textureSize(flat_tex, 0)) * flat_scale;
+				fc = texture(flat_tex, fp / max(fts, vec2(1.0)));
+				fc.a *= COLOR.a;
+			}
+			else
+			{
+				// The roof texture's repeated rows (never its eave), tiled
+				// both ways.
+				float fw = size.x * tex_scale * flat_scale;
+				float fu = fp.x / fw;
+				float fy = fp.y / flat_scale;
+				vec2 fgx = vec2(dFdx(fu) * size.x, dFdx(fy));
+				vec2 fgy = vec2(dFdy(fu) * size.x, dFdy(fy));
+				float flod = 0.5 * log2(max(max(dot(fgx, fgx), dot(fgy, fgy)), 0.00000001));
+				float ft = (size.y - edge_shift - band_start) + mod(fy, max(band, 1.0));
+				fc = base_colour(roof_sample(fu, ft, flod, size), COLOR, v_local);
+			}
+			fc.rgb = tone3(fc.rgb, tone_flat);
+			texel = mix(texel, fc.rgb, f_cov);
+			alpha = mix(alpha, fc.a, f_cov);
+			// Side Lines around the flat part too: its sides are plain cuts.
+			if (side_ink && edge_count > 0)
+			{
+				float f_side = max(ink_h * 0.04, fpx * 1.5);
+				float fde = 100000000.0;
+				for (int i = 0; i < edge_count; i++)
+				{
+					vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+					vec2 ab = e.zw - e.xy;
+					float h = clamp(dot(v_local - e.xy, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
+					fde = min(fde, length(v_local - e.xy - ab * h));
+				}
+				texel *= mix(1.0, 0.12, (1.0 - smoothstep(f_side * 0.5, f_side, fde)) * f_cov);
+			}
+		}
+		float fad = abs(flat_d);
+		if (flat_edge && flat_frac < 0.999)
+		{
+			// Ridge all around the flat part: a cap with the Ridge Caps
+			// settings, centred on its edge.
+			float ehw = cap_hw(true, -1.0);
+			if (fad < ehw * 2.5)
+			{
+				float esh = 0.0;
+				vec2 en = length(face_n) > 0.0001 ? -normalize(face_n) : vec2(0.0, -1.0);
+				vec4 ec = cap_piece(flat_a, flat_d / ehw, -1.0, en, vec2(0.0), ehw, COLOR, size, fpx, esh, true);
+				texel *= 1.0 - (cap_style == 3 ? 0.5 : 0.35) * esh * esh * smoothstep(0.6, 0.95, alpha);
+				if (ec.a > 0.0)
+				{
+					vec3 tb = texel;
+					texel = mix(texel, ec.rgb, ec.a);
+					// (over the eave's cut-outs too)
+					if (alpha < 1.0)
+					{
+						float na = alpha + ec.a * (1.0 - alpha);
+						texel = (texel - tb * (1.0 - ec.a) * (1.0 - alpha)) / max(na, 0.0001);
+						alpha = na;
+					}
+					// Side Lines: cut by the outline, ink line there.
+					if (side_ink && edge_count > 0)
+					{
+						float e_ink = max(ink_h * 0.04, fpx * 1.5);
+						float ede = 100000000.0;
+						for (int i = 0; i < edge_count; i++)
+						{
+							vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+							vec2 ab = e.zw - e.xy;
+							float h = clamp(dot(v_local - e.xy, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
+							ede = min(ede, length(v_local - e.xy - ab * h));
+						}
+						texel *= mix(1.0, 0.12, (1.0 - smoothstep(e_ink * 0.5, e_ink, ede)) * ec.a);
+					}
+				}
+			}
+		}
+		else
+		{
+			// Ink line along the edge of the flat part.
+			float f_ink = max(ink_h * 0.03, fpx);
+			if (flat_frac < 0.999 && fad < f_ink)
+			{
+				texel *= mix(1.0, 0.12, (1.0 - smoothstep(f_ink * 0.5, f_ink, fad)) * smoothstep(0.6, 0.95, alpha));
+			}
+		}
+		h_own = min(h_own, flat_top_h());
+	}
 	float keep = round_keep;
 	if (merge_on)
 	{
@@ -2542,9 +2753,11 @@ func _full_cfg(cfg) -> Dictionary:
 		for k in cfg.keys():
 			out[k] = cfg[k]
 	out["mode"] = _valid_mode(int(out["mode"]))
-	for k in ["curve", "repeat", "cap_width_hip", "cap_tip", "cap_fade", "cap_bright", "cap_hue", "cap_sat", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+	for k in RC_KEYS + ["flat_size", "flat_rot", "flat_scale"]:
 		out[k] = float(out[k])
-	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps", "size_link"]:
+	for k in ["curve", "repeat", "cap_width_hip", "cap_tip", "cap_fade", "cap_width", "edge", "u_offset", "merge_height", "valley_line", "valley_opacity", "valley_width", "scale", "ridge_offset", "pitch", "shade", "light", "apex_x", "apex_y"]:
+		out[k] = float(out[k])
+	for k in ["mirror", "taper", "soft_seams", "apex_on", "shade_on", "merge", "side_ink", "apex_lock", "ridge_caps", "size_link", "flat_on", "recolor"]:
 		out[k] = bool(out[k])
 	# Seams: older roofs only have Softer Seams / Ridge Caps.
 	if not (cfg is Dictionary and cfg.has("seams")):
@@ -2567,11 +2780,26 @@ func _full_cfg(cfg) -> Dictionary:
 		out["cap_width_hip"] = float(out["cap_width"])
 	out["cap_width_on"] = int(clamp(int(out["cap_width_on"]), 0, 2))
 	out["cap_corners"] = int(clamp(int(out["cap_corners"]), 0, 2))
-	# Cap Recolor: on for older roofs with a recolor set.
-	if not (cfg is Dictionary and cfg.has("cap_recolor")):
-		out["cap_recolor"] = out["cap_bright"] != 0.0 or out["cap_hue"] != 0.0 or out["cap_sat"] != 0.0
-	out["cap_recolor"] = bool(out["cap_recolor"])
-	out["cap_recolor_on"] = int(clamp(int(out["cap_recolor_on"]), 0, 2))
+	# Older roofs: Cap Recolor (one setting for the hips, the ridges or both).
+	if cfg is Dictionary and not cfg.has("recolor") and (cfg.has("cap_bright") or cfg.has("cap_hue") or cfg.has("cap_sat") or cfg.has("cap_recolor")):
+		var cb = float(cfg.get("cap_bright", 0.0))
+		var ch = float(cfg.get("cap_hue", 0.0))
+		var cs = float(cfg.get("cap_sat", 0.0))
+		var con = bool(cfg["cap_recolor"]) if cfg.has("cap_recolor") else (cb != 0.0 or ch != 0.0 or cs != 0.0)
+		if con:
+			var which = int(cfg.get("cap_recolor_on", 2))
+			var parts = ["hip"] if which == 0 else (["ridge"] if which == 1 else ["hip", "ridge"])
+			for part in parts:
+				out[part + "_bright"] = cb
+				out[part + "_hue"] = ch
+				out[part + "_sat"] = cs
+			out["recolor"] = true
+			out["recolor_on"] = RC_HIP if which == 0 else (RC_RIDGE if which == 1 else RC_CAPS)
+	for k in ["cap_bright", "cap_hue", "cap_sat", "cap_recolor", "cap_recolor_on"]:
+		out.erase(k)
+	out["recolor_on"] = int(clamp(int(out["recolor_on"]), 0, RC_FLAT))
+	out["flat_src"] = int(clamp(int(out["flat_src"]), 0, 1))
+	out["flat_pattern"] = str(out["flat_pattern"])
 	out["ridge_ends"] = int(clamp(int(out["ridge_ends"]), 0, 1))
 	return out
 
@@ -3666,6 +3894,9 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	# Softer Seams: width (texels) of the blend across ridges / hip lines.
 	var seams = int(cfg.get("seams", SEAMS_SOFT))
 	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and bool(cfg.get("mirror", false)))
+	# Flat Roof with Ridge Caps: a ridge all around the flat part.
+	var flat_ok = bool(cfg.get("flat_on", false)) and not (mode == MODE_FILL and not bool(cfg.get("mirror", false)))
+	mat.set_shader_param("flat_edge", seams == SEAMS_CAPS and flat_ok)
 	# Ridge Caps where there are none: soft seams.
 	if seams == SEAMS_CAPS and not caps_ok:
 		seams = SEAMS_SOFT
@@ -3681,15 +3912,18 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	var rends = int(cfg.get("ridge_ends", 0))
 	mat.set_shader_param("cap_ridge_top", rends == 1)
 	mat.set_shader_param("cap_fade", clamp(float(cfg.get("cap_fade", 15.0)), 0.0, 100.0) / 100.0 if rends == 0 else 0.0)
-	# Cap Brightness -100..100 %: gamma 2 .. 0.5.
-	# Cap Brightness -100..100 %: gamma 4 .. 0.25.
-	# (only with Cap Recolor on)
-	var rc = bool(cfg.get("cap_recolor", false))
-	mat.set_shader_param("cap_tone_on", int(cfg.get("cap_recolor_on", 2)))
-	mat.set_shader_param("cap_gamma", pow(4.0, -clamp(float(cfg.get("cap_bright", 0.0)), -100.0, 100.0) / 100.0) if rc else 1.0)
-	mat.set_shader_param("cap_hue", clamp(float(cfg.get("cap_hue", 0.0)), -180.0, 180.0) / 360.0 if rc else 0.0)
-	# Cap Saturation -100..100 %: grey .. twice as saturated.
-	mat.set_shader_param("cap_sat", 1.0 + clamp(float(cfg.get("cap_sat", 0.0)), -100.0, 100.0) / 100.0 if rc else 1.0)
+	# Recolor (each part its own, plus All Roof on top): Brightness
+	# -100..100 % = gamma 4 .. 0.25, Hue in turns, Saturation -100..100 % =
+	# grey .. twice as saturated.
+	var rc = bool(cfg.get("recolor", false))
+	for part in ["tile", "hip", "ridge", "flat"]:
+		var k = Vector3(1.0, 0.0, 1.0)
+		if rc:
+			var b = float(cfg.get(part + "_bright", 0.0)) + float(cfg.get("all_bright", 0.0))
+			var h = float(cfg.get(part + "_hue", 0.0)) + float(cfg.get("all_hue", 0.0))
+			var sa = float(cfg.get(part + "_sat", 0.0)) + float(cfg.get("all_sat", 0.0))
+			k = Vector3(pow(4.0, -clamp(b, -100.0, 100.0) / 100.0), h / 360.0, 1.0 + clamp(sa, -100.0, 100.0) / 100.0)
+		mat.set_shader_param("tone_" + part, k)
 	mat.set_shader_param("cap_scale", clamp(float(cfg.get("cap_width", 100.0)), 10.0, 500.0) / 100.0)
 	mat.set_shader_param("cap_scale_hip", clamp(float(cfg.get("cap_width_hip", cfg.get("cap_width", 100.0))), 10.0, 500.0) / 100.0)
 	# Cap width from the tile rows (textures without rows: a quarter of the
@@ -3759,6 +3993,139 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	else:
 		_update_fill(mat, poly, cfg, info)
 		_set_edges(mat, poly, _area_centroid(poly), st)
+	_set_flat(mat, poly, cfg, info, mode)
+
+
+# Flat Roof: flat part, its size and texture.
+func _set_flat(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary, info: Dictionary, mode: int) -> void:
+	# (not on Gap Free roofs with one slope)
+	var on = bool(cfg.get("flat_on", false)) and not (mode == MODE_FILL and not bool(cfg.get("mirror", false)))
+	mat.set_shader_param("flat_on", on)
+	if not on:
+		return
+	mat.set_shader_param("flat_frac", clamp(float(cfg.get("flat_size", 40.0)), 0.0, 100.0) / 100.0)
+	var vx = mat.get_shader_param("v_max")
+	var vn = mat.get_shader_param("v_min")
+	vx = float(vx) if vx != null else 0.0
+	vn = float(vn) if vn != null else 0.0
+	mat.set_shader_param("flat_hmax", max(_flat_hmax(poly, cfg, mode, vx, vn, float(info["h"])), 0.001))
+	var src = int(cfg.get("flat_src", 0))
+	var ft = _flat_tex(str(cfg.get("flat_pattern", ""))) if src == 1 else null
+	if ft == null:
+		# (pattern not chosen, or its pack is missing: the roof texture)
+		src = 0
+	else:
+		mat.set_shader_param("flat_tex", ft)
+	mat.set_shader_param("flat_src", src)
+	mat.set_shader_param("flat_rot", deg2rad(float(cfg.get("flat_rot", 0.0))))
+	mat.set_shader_param("flat_scale", clamp(float(cfg.get("flat_scale", 100.0)), 5.0, 1000.0) / 100.0)
+
+
+# Height of the top of a roof (local units, before Pitch): Gap Free from its
+# eave to the far side (Two Slopes: to the ridge), Hip the highest point of
+# its faces. (Centered roofs use their own radius.)
+func _flat_hmax(poly: PoolVector2Array, cfg: Dictionary, mode: int, vmax: float, vmin: float, tex_h: float) -> float:
+	if mode == MODE_HIP:
+		return _hip_hmax(poly)
+	if mode == MODE_FILL:
+		return (vmax - vmin) * tex_h * (0.5 if bool(cfg.get("mirror", false)) else 1.0)
+	return 1.0
+
+
+# Hip roofs: highest point of the faces (the shader's hip_face_d, lowest of
+# all faces), found on a grid then refined around the best point.
+var _hmax_cache = {}
+
+func _hip_hmax(poly: PoolVector2Array) -> float:
+	var n = int(min(poly.size(), MAX_EDGES))
+	if n < 3:
+		return 1.0
+	var key = hash(poly)
+	if _hmax_cache.has(key):
+		return _hmax_cache[key]
+	var area = 0.0
+	for i in range(n):
+		area += poly[i].cross(poly[(i + 1) % n])
+	var sgn = 1.0 if area >= 0.0 else -1.0
+	var dirs = []
+	for i in range(n):
+		dirs.append((poly[(i + 1) % n] - poly[i]).normalized())
+	var edges = []
+	for i in range(n):
+		var d_prev = dirs[(i - 1 + n) % n]
+		var d_next = dirs[(i + 1) % n]
+		edges.append([poly[i], poly[(i + 1) % n], Vector2(dirs[i].y, -dirs[i].x) * sgn,
+			d_prev.cross(dirs[i]) * sgn < -0.0001, dirs[i].cross(d_next) * sgn < -0.0001, d_prev, d_next])
+	var lo = poly[0]
+	var hi = poly[0]
+	for p in poly:
+		lo = Vector2(min(lo.x, p.x), min(lo.y, p.y))
+		hi = Vector2(max(hi.x, p.x), max(hi.y, p.y))
+	var best = 0.0
+	var bp = (lo + hi) * 0.5
+	var steps = 20
+	for it in range(4):
+		var cell = (hi - lo) / float(steps)
+		for ix in range(steps + 1):
+			for iy in range(steps + 1):
+				var p = lo + Vector2(cell.x * ix, cell.y * iy)
+				if not Geometry.is_point_in_polygon(p, poly):
+					continue
+				var h = _hip_h(p, edges)
+				if h > best:
+					best = h
+					bp = p
+		lo = bp - cell * 1.5
+		hi = bp + cell * 1.5
+		steps = 8
+	if _hmax_cache.size() > 256:
+		_hmax_cache.clear()
+	_hmax_cache[key] = best
+	return best
+
+
+func _hip_h(p: Vector2, edges: Array) -> float:
+	var best = 100000000.0
+	for e in edges:
+		var a: Vector2 = e[0]
+		var ab: Vector2 = e[1] - a
+		var outn: Vector2 = e[2]
+		var abn = ab.normalized()
+		var h = (p - a).dot(ab) / max(ab.dot(ab), 0.000001)
+		var inner = (p - a).dot(outn) <= 0.0
+		var ext = (h >= 0.0 and h <= 1.0) \
+			or (inner and h < 0.0 and e[3] and (p - a).dot(e[5] + abn) > 0.0) \
+			or (inner and h > 1.0 and e[4] and (p - e[1]).dot(abn + e[6]) < 0.0)
+		if not ext and ((h < 0.0 and e[3]) or (h > 1.0 and e[4])):
+			continue
+		var d = abs((p - a).dot(outn)) if ext else (p - a - ab * clamp(h, 0.0, 1.0)).length()
+		best = min(best, d)
+	return best
+
+
+# Flat Roof pattern: its texture, tiled (DD's copy may not repeat).
+var _flat_tex_cache = {}
+
+func _flat_tex(path: String):
+	if path == "":
+		return null
+	var t = _flat_tex_cache.get(path)
+	if t is Texture:
+		return t
+	t = _load_asset_tex(path, true)
+	if t is Texture and (t.flags & Texture.FLAG_REPEAT) == 0:
+		var img = t.get_data()
+		if img != null and not img.is_empty():
+			img = img.duplicate()
+			if img.is_compressed():
+				img.decompress()
+			var it = ImageTexture.new()
+			it.create_from_image(img, Texture.FLAG_MIPMAPS | Texture.FLAG_FILTER | Texture.FLAG_REPEAT)
+			t = it
+	if not (t is Texture):
+		return null
+	_flat_tex_cache[path] = t
+	return t
 
 
 # Distance (texels, like t) from the shape outline to the visible eave.
@@ -3946,6 +4313,15 @@ func _set_merge(mat: ShaderMaterial, cfg: Dictionary, st: Dictionary) -> void:
 		img.set_pixel(4, r0, Color(size.x, size.y, vmax, vmin))
 		var pre = _round_ends(poly, size, rot, pcfg) if pmode == MODE_FILL else [false, false, 0.0, 0.0, 1.0]
 		img.set_pixel(5, r0, Color((1.0 if pre[0] else 0.0) + (2.0 if pre[1] else 0.0), pre[2], pre[3], pre[4]))
+		# Flat Roof: height of its flat top (-1: none).
+		var fcap = -1.0
+		if bool(pcfg.get("flat_on", false)) and not (pmode == MODE_FILL and not bool(pcfg.get("mirror", false))):
+			var pf = 1.0 - clamp(float(pcfg.get("flat_size", 40.0)), 0.0, 100.0) / 100.0
+			if pmode == MODE_CENTER:
+				fcap = pf * ref_d * pscale
+			else:
+				fcap = pf * _flat_hmax(poly, pcfg, pmode, vmax, vmin, size.y) * pscale
+		img.set_pixel(6, r0, Color(fcap, 0.0, 0.0, 0.0))
 		var ei = _edges_image(poly, n)
 		ei.lock()
 		for i in range(n):
@@ -5119,7 +5495,43 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 	else:
 		header.hint_tooltip = "Turns the selected pattern shapes into roofs (ON)\nor back into plain patterns (OFF)."
 	header.connect("toggled", self, "_on_enabled_toggled", [section])
-	root.add_child(header)
+	# Frame around the switch and all the settings (Copy / Paste Settings
+	# included): drawn with Roof Builder ON.
+	var outer = PanelContainer.new()
+	outer.add_stylebox_override("panel", _outer_style(false))
+	root.add_child(outer)
+	var fbox = VBoxContainer.new()
+	outer.add_child(fbox)
+	var fold = null
+	if full:
+		# Select Tool: a cog folds the settings away (left of the switch).
+		var hrow = HBoxContainer.new()
+		fbox.add_child(hrow)
+		var htext = header.text
+		var hicon = header.icon
+		header.text = ""
+		header.icon = null
+		if hicon != null:
+			var tr = TextureRect.new()
+			tr.texture = hicon
+			tr.stretch_mode = TextureRect.STRETCH_KEEP_CENTERED
+			tr.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			hrow.add_child(tr)
+		var hl = Label.new()
+		hl.text = htext
+		hl.hint_tooltip = header.hint_tooltip
+		hl.mouse_filter = Control.MOUSE_FILTER_PASS
+		hl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		hrow.add_child(hl)
+		fold = _make_cog(section, "Shows / hides the Roof Builder settings.")
+		fold.set_pressed_no_signal(true)
+		hrow.add_child(fold)
+		hrow.add_child(header)
+	else:
+		fbox.add_child(header)
+	var inner = VBoxContainer.new()
+	fbox.add_child(inner)
+	inner.add_child(HSeparator.new())
 	var clip_row = null
 	if full:
 		# Copy / paste every roof setting (not the texture) between roofs.
@@ -5143,7 +5555,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		clip_row.add_child(pb)
 
 	var opts = VBoxContainer.new()
-	root.add_child(opts)
+	inner.add_child(opts)
 	var lib = CheckButton.new()
 	lib.text = "Auto Roof Library"
 	lib.focus_mode = Control.FOCUS_NONE
@@ -5152,9 +5564,10 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 	lib.connect("toggled", self, "_on_lib_toggled")
 	opts.add_child(lib)
 	var mode_row = HBoxContainer.new()
+	mode_row.add_constant_override("separation", 3)
 	opts.add_child(mode_row)
 	var group = ButtonGroup.new()
-	var c = {"root": root, "header": header, "opts": opts, "full": full, "modes": {}, "lib": lib, "clip": clip_row}
+	var c = {"root": root, "header": header, "opts": opts, "outer": outer, "inner": inner, "fold": fold, "full": full, "modes": {}, "lib": lib, "clip": clip_row}
 	c["modes"][MODE_FILL] = _make_mode_button(mode_row, group, "Gap Free",
 		"The texture's bottom edge (eave) is drawn once, on the lower\nedge of the shape, and only the repeatable part is tiled above\nit, so large roofs no longer show holes.",
 		MODE_FILL, section)
@@ -5207,15 +5620,6 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 			"Width of the caps chosen above.", section, "cap_wsl", icon_reset)
 		c["cap_wsl"]["row"].get_child(0).visible = false
 		c["cap_wvals"] = [100.0, 100.0]
-		c["cap_bright"] = _make_slider(opts, "Cap Brightness", -100.0, 100.0, "%",
-			"Brightness of the ridge caps (changes their gamma: darker\nor lighter than the roof).",
-			section, "cap_bright", icon_reset)
-		c["cap_hue"] = _make_slider(opts, "Cap Hue", -180.0, 180.0, "°",
-			"Turns the colour of the ridge caps around the colour wheel.",
-			section, "cap_hue", icon_reset)
-		c["cap_sat"] = _make_slider(opts, "Cap Saturation", -100.0, 100.0, "%",
-			"Colour strength of the ridge caps: -100% grey, +100% twice\nas strong.",
-			section, "cap_sat", icon_reset)
 		c["cap_outline"] = _make_option(opts, "Cap Outline", ["None", "Line", "Blurred"],
 			"Edge of the ridge caps: plain, a black ink line, or blurred\n(the cap fades out toward its sides).",
 			section, "cap_outline")
@@ -5231,11 +5635,6 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["cap_fade"] = _make_slider(opts, "Ridge Fade", 0.0, 100.0, "%",
 			"Width of the cross-fade where the caps meet (0%: hard cut).",
 			section, "cap_fade", icon_reset)
-		c["cap_recolor"] = _make_toggle(opts, "Cap Recolor",
-			"Changes the brightness, hue and saturation of the ridge caps.",
-			section, "cap_recolor")
-		c["cap_recolor_on"] = _make_option(opts, "Recolor", ["Hip", "Ridge", "Both"],
-			"Which caps Cap Recolor changes.", section, "cap_recolor_on")
 		c["corners_cog"] = _make_cog(section, "Cap Corners settings: length.")
 		c["cap_corners"]["row"].add_child(c["corners_cog"])
 		c["ridge_cog"] = _make_cog(section, "Ridge Ends settings: fade.")
@@ -5246,7 +5645,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["seams_cog"] = _make_cog(section, "Ridge Caps settings: style, width, brightness and outline.")
 		c["seams"]["row"].add_child(c["seams_cog"])
 		c["cap_box"] = _make_box(opts, c["seams"]["row"].get_index() + 1,
-			[c["cap_style"]["row"], c["cap_path_hip"]["row"], c["cap_path_ridge"]["row"], c["cap_width_on"]["row"], c["cap_wsl"]["row"], c["cap_outline"]["row"], c["cap_corners"]["row"], c["cap_tip"]["row"], c["ridge_ends"]["row"], c["cap_fade"]["row"], c["cap_recolor"], c["cap_recolor_on"]["row"], c["cap_bright"]["row"], c["cap_hue"]["row"], c["cap_sat"]["row"], c["cap_sep"]])
+			[c["cap_style"]["row"], c["cap_path_hip"]["row"], c["cap_path_ridge"]["row"], c["cap_width_on"]["row"], c["cap_wsl"]["row"], c["cap_outline"]["row"], c["cap_corners"]["row"], c["cap_tip"]["row"], c["ridge_ends"]["row"], c["cap_fade"]["row"], c["cap_sep"]])
 		c["taper"] = _make_toggle(opts, "Taper Toward Top",
 			"Each course of tiles gets its own tile count, fewer and fewer\ntoward the top, like a real conical roof: the tiles keep about\nthe same width and the count changes on the row edges, under\nthe overlap of the course above.",
 			section, "taper")
@@ -5255,7 +5654,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 			section, "curve", icon_reset)
 		# Curve right under Profile.
 		opts.move_child(c["curve"]["row"], c["profile"]["row"].get_index() + 1)
-		c["apex_on"] = _make_toggle(opts, "Custom Top Position",
+		c["apex_on"] = _switch_cog(c, opts, "Custom Top Position", "Custom Top Position settings: X / Y.",
 			"Moves the roof top away from the centre of the shape.",
 			section, "apex_on")
 		c["apex_box"] = _make_apex_box(opts, c, section, icon_reset)
@@ -5294,7 +5693,7 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["global_light"] = _make_toggle(opts, "Global Lighting",
 			"One light for every roof of the map: Shading Strength and\nLight Direction then change all roofs at once.\nSaved with the map.",
 			section, "global_light")
-		c["shade_on"] = _make_toggle(opts, "Shading",
+		c["shade_on"] = _switch_cog(c, opts, "Shading", "Shading settings: Global Lighting, Shading Strength and\nLight Direction.",
 			"Lights one side of the roof and darkens the other,\nusing the Shading Strength and Light Direction below.",
 			section, "shade_on")
 		c["scale"] = _make_slider(opts, "Tile Width", 10.0, 400.0, "%",
@@ -5335,8 +5734,8 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		c["shade_sep"] = HSeparator.new()
 		opts.add_child(c["shade_sep"])
 		opts.move_child(c["shade_sep"], c["pitch"]["row"].get_index() + 1)
-		opts.move_child(c["shade_on"], c["shade_sep"].get_index() + 1)
-		opts.move_child(c["global_light"], c["shade_on"].get_index() + 1)
+		opts.move_child(c["shade_on_row"], c["shade_sep"].get_index() + 1)
+		opts.move_child(c["global_light"], c["shade_on_row"].get_index() + 1)
 		c["shade"] = _make_slider(opts, "Shading Strength", 0.0, 100.0, "%",
 			"Strength of the light/shadow effect on the roof sides.",
 			section, "shade", icon_reset)
@@ -5354,15 +5753,165 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 		tlbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		trow.add_child(tlbl)
 		c["tex_cog"] = _make_cog(section, "Show the texture settings.")
+		var tres = _make_reset(icon_reset, "Reset all the Texture Settings")
+		tres.connect("pressed", self, "_on_tex_reset", [section])
+		trow.add_child(tres)
 		trow.add_child(c["tex_cog"])
 		c["tex_box"] = _make_box(opts, trow.get_index() + 1,
 			[c["scale"]["row"], c["ridge_offset"]["row"], c["repeat"]["row"], c["edge"]["row"], c["u_offset"]["row"], c["pitch"]["row"]])
+		# Flat Roof (under Side Lines): the top of the roof is flat.
+		c["flat_on"] = _switch_cog(c, opts, "Flat Roof", "Flat Roof settings: texture, size, rotation and scale.",
+			"The top of the roof is flat (all modes), with the roof texture\nor a pattern laid flat over it.",
+			section, "flat_on")
+		opts.move_child(c["flat_on_row"], c["side_ink"].get_index() + 1)
+		c["flat_size"] = _make_slider(opts, "Flat Size", 0.0, 100.0, "%",
+			"Size of the flat part: share of the roof from its top down to\nthe eave (100%: all flat).",
+			section, "flat_size", icon_reset)
+		c["flat_src"] = _make_option(opts, "Flat Texture", ["Roof Texture", "Pattern"],
+			"Texture of the flat part: the roof's own (its tile rows, without\nthe eave), or a pattern picked below.",
+			section, "flat_src")
+		c["flat_pattern"] = _make_path_pick(opts, "Flat Pattern", "Pattern laid on the flat part.", section, "flat_pattern")
+		c["flat_pattern"]["kind"] = "pattern"
+		c["flat_rot"] = _make_slider(opts, "Flat Rotation", 0.0, 359.0, "°",
+			"Turns the texture of the flat part (from the roof texture's\nrotation).",
+			section, "flat_rot", icon_reset)
+		c["flat_scale"] = _make_slider(opts, "Flat Scale", 10.0, 400.0, "%",
+			"Size of the texture of the flat part.",
+			section, "flat_scale", icon_reset)
+		c["flat_sep"] = HSeparator.new()
+		opts.add_child(c["flat_sep"])
+		c["flat_box"] = _make_box(opts, c["flat_on_row"].get_index() + 1,
+			[c["flat_src"]["row"], c["flat_pattern"]["row"], c["flat_size"]["row"], c["flat_rot"]["row"], c["flat_scale"]["row"], c["flat_sep"]])
+		# Recolor (at the bottom, under Shading): one set of sliders, each
+		# part of the roof keeps its own values; the menu picks what they
+		# change.
+		c["rc_sep"] = HSeparator.new()
+		opts.add_child(c["rc_sep"])
+		opts.move_child(c["rc_sep"], c["light"]["row"].get_index() + 1)
+		c["recolor"] = _switch_cog(c, opts, "Recolor", "Recolor settings: part, brightness, hue and saturation.",
+			"Changes the brightness, hue and saturation of the roof: each\npart (tiles, hips, ridges, flat part) has its own.",
+			section, "recolor")
+		opts.move_child(c["recolor_row"], c["rc_sep"].get_index() + 1)
+		c["recolor_on"] = _make_option(opts, "Part", ["All Roof", "Tiles", "Hip & Ridge", "Hip", "Ridge", "Flat Part"],
+			"The part the sliders below change. All Roof: its own values,\nadded to each part's. Hip & Ridge: both at once. Hip, Ridge:\nwith Ridge Caps; Flat Part: with Flat Roof.",
+			section, "recolor_on")
+		c["rc_bright"] = _make_slider(opts, "Brightness", -100.0, 100.0, "%",
+			"Brightness (changes the gamma: darker or lighter).",
+			section, "rc_bright", icon_reset)
+		c["rc_hue"] = _make_slider(opts, "Hue", -180.0, 180.0, "°",
+			"Turns the colour around the colour wheel.",
+			section, "rc_hue", icon_reset)
+		c["rc_sat"] = _make_slider(opts, "Saturation", -100.0, 100.0, "%",
+			"Colour strength: -100% grey, +100% twice as strong.",
+			section, "rc_sat", icon_reset)
+		c["rc_vals"] = {}
+		var rres = _make_reset(icon_reset, "Reset Recolor: every part back to its default")
+		rres.connect("pressed", self, "_on_rc_reset", [section])
+		c["rc_reset"] = rres
+		c["recolor_row"].add_child(rres)
+		c["recolor_row"].move_child(rres, c["recolor_cog"].get_index())
+		c["rc_box"] = _make_box(opts, c["recolor_row"].get_index() + 1,
+			[c["recolor_on"]["row"], c["rc_bright"]["row"], c["rc_hue"]["row"], c["rc_sat"]["row"]])
+	_group_ui(c)
 	if clip_row != null:
-		# At the bottom of the section, under a divider (the panel already
-		# has one below the section).
-		root.add_child(HSeparator.new())
-		root.add_child(clip_row)
+		# At the bottom of the settings, under a divider.
+		inner.add_child(HSeparator.new())
+		inner.add_child(clip_row)
 	return c
+
+
+# Groups: each big part of the section in its own framed box (Shape, Seams,
+# Flat Roof, Merge, Lighting, Texture, Recolor), in that order under Auto
+# Roof Library. The dividers between them go (kept in a hidden holder: their
+# visibility is still set).
+func _group_ui(c: Dictionary) -> void:
+	var opts: VBoxContainer = c["opts"]
+	opts.add_constant_override("separation", 6)
+	var full = c["full"]
+	var shape = [c["modes"].values()[0].get_parent(), c["mirror"], c["round_ends"]["row"], c["profile"]["row"]]
+	var seams = [c["seams"]["row"]]
+	var groups = []
+	if full:
+		shape += [c["curve"]["row"], c["taper"], c["apex_on_row"], c["apex_box"]]
+		seams += [c["cap_box"], c["side_ink"]]
+		groups = [shape, seams, [c["flat_on_row"], c["flat_box"]], [c["merge"].get_parent(), c["merge_box"]],
+			[c["shade_on_row"], c["global_light"], c["shade"]["row"], c["light"]["row"]],
+			[c["tex_cog"].get_parent(), c["tex_box"]], [c["recolor_row"], c["rc_box"]]]
+	else:
+		groups = [shape, seams, [c["merge"]]]
+	var holder = Control.new()
+	holder.visible = false
+	opts.add_child(holder)
+	for k in ["merge_sep", "shade_sep", "rc_sep", "flat_sep"]:
+		if c.has(k):
+			c[k].get_parent().remove_child(c[k])
+			holder.add_child(c[k])
+	c["groups"] = []
+	for members in groups:
+		var panel = PanelContainer.new()
+		panel.add_stylebox_override("panel", _group_style())
+		var vb = VBoxContainer.new()
+		panel.add_child(vb)
+		opts.add_child(panel)
+		for m in members:
+			m.get_parent().remove_child(m)
+			vb.add_child(m)
+		c["groups"].append(panel)
+	opts.move_child(holder, opts.get_child_count() - 1)
+
+
+var _group_sb = null
+var _outer_sb = null
+var _outer_off = null
+
+# The section's frame (off: none, same margins so nothing moves).
+func _outer_style(on: bool) -> StyleBox:
+	if not on:
+		if _outer_off == null:
+			_outer_off = StyleBoxEmpty.new()
+			_outer_off.content_margin_left = 4
+			_outer_off.content_margin_right = 4
+			_outer_off.content_margin_top = 4
+			_outer_off.content_margin_bottom = 4
+		return _outer_off
+	if _outer_sb == null:
+		_outer_sb = StyleBoxFlat.new()
+		_outer_sb.bg_color = Color(0, 0, 0, 0.12)
+		_outer_sb.border_color = Color(0.45, 0.65, 1.0, 0.5)
+		_outer_sb.set_border_width_all(1)
+		_outer_sb.set_corner_radius_all(5)
+		_outer_sb.content_margin_left = 4
+		_outer_sb.content_margin_right = 4
+		_outer_sb.content_margin_top = 4
+		_outer_sb.content_margin_bottom = 4
+	return _outer_sb
+
+func _group_style() -> StyleBoxFlat:
+	if _group_sb == null:
+		_group_sb = StyleBoxFlat.new()
+		_group_sb.bg_color = Color(1, 1, 1, 0.045)
+		# (DD's blue, faint)
+		_group_sb.border_color = Color(0.45, 0.65, 1.0, 0.3)
+		_group_sb.set_border_width_all(1)
+		# Accent on the left: where a group starts and ends at a glance.
+		_group_sb.border_width_left = 3
+		_group_sb.set_corner_radius_all(4)
+		_group_sb.content_margin_left = 6
+		_group_sb.content_margin_right = 4
+		_group_sb.content_margin_top = 4
+		_group_sb.content_margin_bottom = 5
+	return _group_sb
+
+
+# A group shows when one of its settings does.
+func _update_groups(c: Dictionary) -> void:
+	for panel in c.get("groups", []):
+		var any = false
+		for m in panel.get_child(0).get_children():
+			if m.visible:
+				any = true
+				break
+		panel.visible = any
 
 
 # Settings cog: toggles a hidden group of settings (see _update_visibility).
@@ -5378,6 +5927,31 @@ func _make_cog(section: String, tip: String) -> Button:
 	cog.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	cog.connect("toggled", self, "_on_merge_cog", [section])
 	return cog
+
+
+# A switch with its settings cog: label, cog, then the switch (like Merge
+# With Roof Below). The cog shows / hides the settings the switch turns on
+# (it opens when the switch is turned on). Keys: field, field_row, field_cog.
+func _switch_cog(c: Dictionary, parent: Node, text: String, cog_tip: String, tip: String, section: String, field: String) -> CheckButton:
+	var row = HBoxContainer.new()
+	parent.add_child(row)
+	var lbl = Label.new()
+	lbl.text = text
+	lbl.hint_tooltip = tip
+	lbl.mouse_filter = Control.MOUSE_FILTER_PASS
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(lbl)
+	var cog = _make_cog(section, cog_tip)
+	row.add_child(cog)
+	c[field + "_row"] = row
+	c[field + "_cog"] = cog
+	return _make_toggle(row, "", tip, section, field)
+
+
+# A cog greyed out while its switch is off.
+func _cog_on(cog: Button, on: bool) -> void:
+	cog.disabled = not on
+	cog.modulate = Color(1, 1, 1, 1) if on else Color(1, 1, 1, 0.35)
 
 
 # Moves controls of opts into a new box at index (hidden until its cog is on).
@@ -5403,6 +5977,8 @@ func _make_mode_button(parent: Node, group: ButtonGroup, text: String, tip: Stri
 	b.connect("pressed", self, "_on_mode_pressed", [mode, section])
 	parent.add_child(b)
 	_style_mode_button(b)
+	# Width after the text: "Hip" leaves room for the longer names.
+	b.size_flags_stretch_ratio = float(text.length() + 2)
 	return b
 
 
@@ -5427,8 +6003,8 @@ func _style_mode_button(b: Button) -> void:
 		sb.set_border_width_all(1)
 		sb.set_corner_radius_all(3)
 		sb.anti_aliasing = true
-		sb.content_margin_left = 4
-		sb.content_margin_right = 4
+		sb.content_margin_left = 3
+		sb.content_margin_right = 3
 		sb.content_margin_top = 3
 		sb.content_margin_bottom = 3
 		b.add_stylebox_override(state, sb)
@@ -5491,11 +6067,14 @@ func _on_option_selected(index: int, section: String, field: String) -> void:
 	var c = _ui.get(section)
 	if field == "cap_style" and index == CAP_PATH and c != null and c.has("cap_path_ridge") and c["cap_path_ridge"]["path"] == "" and c["cap_path_hip"]["path"] == "":
 		_open_path_pop(section, "cap_path_ridge")
+	if field == "flat_src" and index == 1 and c != null and c.has("flat_pattern") and c["flat_pattern"]["path"] == "":
+		_open_path_pop(section, "flat_pattern")
+	if field == "recolor_on":
+		_rc_show(section)
 
 
 const CAP_KEYS = ["cap_style", "cap_path_ridge", "cap_path_hip", "cap_width", "cap_width_hip", "cap_width_on",
-	"cap_outline", "cap_corners", "cap_tip", "ridge_ends", "cap_fade", "cap_recolor", "cap_recolor_on",
-	"cap_bright", "cap_hue", "cap_sat"]
+	"cap_outline", "cap_corners", "cap_tip", "ridge_ends", "cap_fade"]
 
 # Reset button beside Cap Style: every Ridge Caps setting back to default.
 func _on_caps_reset(section: String) -> void:
@@ -5807,17 +6386,22 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		c["cap_wvals"] = [full["cap_width_hip"], full["cap_width"]]
 		c["cap_width_on"]["option"].select(full["cap_width_on"])
 		_wsl_show(section)
-		_set_ctl(c["cap_bright"], full["cap_bright"])
-		_set_ctl(c["cap_hue"], full["cap_hue"])
-		_set_ctl(c["cap_sat"], full["cap_sat"])
 		c["cap_style"]["option"].select(c["cap_style"]["option"].get_item_index(full["cap_style"]))
 		_set_path_pick(c["cap_path_ridge"], full["cap_path_ridge"], false)
 		_set_path_pick(c["cap_path_hip"], full["cap_path_hip"], true)
 		c["cap_corners"]["option"].select(full["cap_corners"])
 		_set_ctl(c["cap_tip"], full["cap_tip"])
 		c["ridge_ends"]["option"].select(full["ridge_ends"])
-		c["cap_recolor"].pressed = full["cap_recolor"]
-		c["cap_recolor_on"]["option"].select(full["cap_recolor_on"])
+		c["flat_on"].pressed = full["flat_on"]
+		_set_ctl(c["flat_size"], full["flat_size"])
+		c["flat_src"]["option"].select(full["flat_src"])
+		_set_path_pick(c["flat_pattern"], full["flat_pattern"], false)
+		_set_ctl(c["flat_rot"], full["flat_rot"])
+		_set_ctl(c["flat_scale"], full["flat_scale"])
+		c["recolor"].pressed = full["recolor"]
+		c["recolor_on"]["option"].select(full["recolor_on"])
+		for k in RC_KEYS:
+			c["rc_vals"][k] = full[k]
 		_set_ctl(c["cap_fade"], full["cap_fade"])
 		c["apex_x"].value = round(full["apex_x"] * 100.0)
 		c["apex_y"].value = round(full["apex_y"] * 100.0)
@@ -5870,17 +6454,22 @@ func _read_ui_cfg(section: String) -> Dictionary:
 		cfg["cap_width"] = float(c["cap_wvals"][1])
 		cfg["cap_width_hip"] = float(c["cap_wvals"][0])
 		cfg["cap_width_on"] = c["cap_width_on"]["option"].selected
-		cfg["cap_bright"] = float(c["cap_bright"]["spin"].value)
-		cfg["cap_hue"] = float(c["cap_hue"]["spin"].value)
-		cfg["cap_sat"] = float(c["cap_sat"]["spin"].value)
 		cfg["cap_style"] = c["cap_style"]["option"].get_selected_id()
 		cfg["cap_path_ridge"] = c["cap_path_ridge"]["path"]
 		cfg["cap_path_hip"] = c["cap_path_hip"]["path"]
 		cfg["cap_corners"] = c["cap_corners"]["option"].selected
 		cfg["cap_tip"] = float(c["cap_tip"]["spin"].value)
 		cfg["ridge_ends"] = c["ridge_ends"]["option"].selected
-		cfg["cap_recolor"] = c["cap_recolor"].pressed
-		cfg["cap_recolor_on"] = c["cap_recolor_on"]["option"].selected
+		cfg["flat_on"] = c["flat_on"].pressed
+		cfg["flat_size"] = float(c["flat_size"]["spin"].value)
+		cfg["flat_src"] = c["flat_src"]["option"].selected
+		cfg["flat_pattern"] = c["flat_pattern"]["path"]
+		cfg["flat_rot"] = float(c["flat_rot"]["spin"].value)
+		cfg["flat_scale"] = float(c["flat_scale"]["spin"].value)
+		cfg["recolor"] = c["recolor"].pressed
+		cfg["recolor_on"] = c["recolor_on"]["option"].selected
+		for k in RC_KEYS:
+			cfg[k] = float(c["rc_vals"].get(k, 0.0))
 		cfg["cap_fade"] = float(c["cap_fade"]["spin"].value)
 		cfg["apex_x"] = float(c["apex_x"].value) / 100.0
 		cfg["apex_y"] = float(c["apex_y"].value) / 100.0
@@ -5893,6 +6482,12 @@ func _update_visibility(section: String) -> void:
 	if c == null or not is_instance_valid(c["root"]):
 		return
 	c["opts"].visible = c["header"].pressed
+	# (the frame and all under the switch, Copy / Paste Settings included,
+	# with Roof Builder ON)
+	c["inner"].visible = c["header"].pressed and (c["fold"] == null or c["fold"].pressed)
+	if c["fold"] != null:
+		_cog_on(c["fold"], c["header"].pressed)
+	c["outer"].add_stylebox_override("panel", _outer_style(c["header"].pressed))
 	if c.get("clip") != null:
 		c["clip"].get_child(0).disabled = not c["header"].pressed
 	var mode = _ui_mode(section)
@@ -5901,8 +6496,12 @@ func _update_visibility(section: String) -> void:
 	# Seams: wherever the roof has ridge / hip lines; Ridge Caps only on Hip
 	# and Gap Free with Two Slopes.
 	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and c["mirror"].pressed)
-	c["seams"]["row"].visible = mode != MODE_FILL or c["mirror"].pressed
-	c["seams"]["option"].set_item_disabled(SEAMS_CAPS, not caps_ok)
+	# Flat Roof: Ridge Caps in every mode (a ridge around the flat part).
+	# (none on Gap Free roofs with one slope: Two Slopes off)
+	var flat_ok = not (mode == MODE_FILL and not c["mirror"].pressed)
+	var flat = c.has("flat_on") and c["flat_on"].pressed and flat_ok
+	c["seams"]["row"].visible = mode != MODE_FILL or c["mirror"].pressed or flat
+	c["seams"]["option"].set_item_disabled(SEAMS_CAPS, not (caps_ok or flat))
 	if c.has("cap_style") and section == "select":
 		# Roof Pieces only for textures that have them (all the selection).
 		var pieces_ok = not _sel_shapes.empty()
@@ -5919,8 +6518,11 @@ func _update_visibility(section: String) -> void:
 	c["profile"]["row"].visible = mode == MODE_CENTER
 	if c.has("curve"):
 		c["curve"]["row"].visible = mode == MODE_CENTER and c["profile"]["option"].selected != PROFILE_CONE
-	var caps_on = caps_ok and c["seams"]["option"].selected == SEAMS_CAPS
+	# caps_real: ridge / hip caps; caps_on: those or the flat part's ridge.
+	var caps_real = caps_ok and c["seams"]["option"].selected == SEAMS_CAPS
+	var caps_on = (caps_ok or flat) and c["seams"]["option"].selected == SEAMS_CAPS
 	if not c["full"]:
+		_update_groups(c)
 		return
 	var shaded = mode != MODE_FILL or c["mirror"].pressed
 	c["ridge_offset"]["row"].visible = mode == MODE_FILL and c["mirror"].pressed
@@ -5936,30 +6538,52 @@ func _update_visibility(section: String) -> void:
 	c["seams_cog"].disabled = not caps_on
 	c["seams_cog"].modulate = Color(1, 1, 1, 1) if caps_on else Color(1, 1, 1, 0.35)
 	c["cap_box"].visible = caps_on and c["seams_cog"].pressed
+	# Hips: Hip roofs with Ridge Caps (Gap Free: a ridge; the ridge around
+	# a flat part alone: no hips nor joints).
+	var hips = caps_real and mode == MODE_HIP
 	var mitred = c["ridge_ends"]["option"].selected == 0
+	c["ridge_ends"]["row"].visible = caps_real
 	c["ridge_cog"].disabled = not mitred
 	c["ridge_cog"].modulate = Color(1, 1, 1, 1) if mitred else Color(1, 1, 1, 0.35)
-	c["cap_fade"]["row"].visible = mitred and c["ridge_cog"].pressed
-	c["cap_tip"]["row"].visible = c["corners_cog"].pressed
+	c["cap_fade"]["row"].visible = caps_real and mitred and c["ridge_cog"].pressed
+	c["cap_corners"]["row"].visible = hips
+	c["cap_tip"]["row"].visible = hips and c["corners_cog"].pressed
 	var path_on = c["cap_style"]["option"].get_selected_id() == CAP_PATH
-	# Gap Free (Two Slopes): a ridge, no hips.
-	var hips = mode != MODE_FILL
 	c["cap_path_ridge"]["row"].visible = path_on
 	c["cap_path_hip"]["row"].visible = path_on and hips
 	c["cap_width_on"]["row"].visible = hips
-	for k in ["cap_bright", "cap_hue", "cap_sat"]:
-		c[k]["row"].visible = c["cap_recolor"].pressed
-	# (Gap Free: a ridge only)
-	c["cap_recolor_on"]["row"].visible = c["cap_recolor"].pressed and mode != MODE_FILL
+	# Flat Roof (not on Gap Free with one slope).
+	c["flat_on_row"].visible = flat_ok
+	_cog_on(c["flat_on_cog"], flat)
+	c["flat_box"].visible = flat and c["flat_on_cog"].pressed
+	c["flat_pattern"]["row"].visible = c["flat_src"]["option"].selected == 1
+	# Recolor: parts the roof does not have greyed (back to All Roof).
+	_cog_on(c["recolor_cog"], c["recolor"].pressed)
+	_cog_on(c["rc_reset"], c["recolor"].pressed)
+	c["rc_box"].visible = c["recolor"].pressed and c["recolor_cog"].pressed
+	var rco = c["recolor_on"]["option"]
+	rco.set_item_disabled(RC_CAPS, not caps_on)
+	rco.set_item_disabled(RC_HIP, not hips)
+	rco.set_item_disabled(RC_RIDGE, not caps_on)
+	rco.set_item_disabled(RC_FLAT, not flat)
+	if rco.is_item_disabled(rco.selected):
+		rco.select(RC_ALL)
+		if not _updating_ui:
+			_apply_fields(section, {"recolor_on": RC_ALL})
+	_rc_show(section)
 	c["tex_box"].visible = c["tex_cog"].pressed
-	c["shade_on"].visible = shaded
+	c["shade_on_row"].visible = shaded
 	c["shade_sep"].visible = shaded
-	c["global_light"].visible = shaded and c["shade_on"].pressed
+	_cog_on(c["shade_on_cog"], c["shade_on"].pressed)
+	var shade_open = shaded and c["shade_on"].pressed and c["shade_on_cog"].pressed
+	c["global_light"].visible = shade_open
 	c["merge"].visible = true
-	c["shade"]["row"].visible = shaded and c["shade_on"].pressed
-	c["light"]["row"].visible = shaded and c["shade_on"].pressed
-	c["apex_on"].visible = mode == MODE_CENTER
-	c["apex_box"].visible = mode == MODE_CENTER and c["apex_on"].pressed
+	c["shade"]["row"].visible = shade_open
+	c["light"]["row"].visible = shade_open
+	c["apex_on_row"].visible = mode == MODE_CENTER
+	_cog_on(c["apex_on_cog"], c["apex_on"].pressed)
+	c["apex_box"].visible = mode == MODE_CENTER and c["apex_on"].pressed and c["apex_on_cog"].pressed
+	_update_groups(c)
 
 
 # ── Cap Style Path: Path Tool textures ──
@@ -5972,6 +6596,30 @@ var _path_pop_list = null
 var _path_pop_search = null
 var _path_pop_target = []
 var _path_pop_same = null
+var _path_pop_kind = "path"
+var _pop_search_mem = {}
+# Patterns seen in DD's pattern lists (path -> icon), for the Flat Pattern.
+var _patterns_seen = {}
+
+
+func _pattern_items() -> Array:
+	for tool_name in ["PatternShapeTool", "SelectTool"]:
+		for grid in _grid_menus(tool_name, true):
+			for i in range(grid.get_item_count()):
+				if grid.get_item_tooltip(i).ends_with(LIB_MARK):
+					continue
+				var m = grid.get_item_metadata(i)
+				var ic = grid.get_item_icon(i)
+				if m is String and m != "" and ic is Texture:
+					_patterns_seen[m] = ic
+	# The lists filtered by Auto Roof Library: their full content.
+	for st in _lib_state.values():
+		for d in st["snap"]:
+			if d["meta"] is String and d["meta"] != "" and d["icon"] is Texture:
+				_patterns_seen[d["meta"]] = d["icon"]
+	var out = _patterns_seen.keys()
+	out.sort_custom(self, "_path_name_less")
+	return out
 
 
 func _path_items() -> Array:
@@ -6042,14 +6690,15 @@ func _make_path_pick(parent: Node, text: String, tip: String, section: String, f
 func _set_path_pick(pick: Dictionary, path: String, hip: bool) -> void:
 	pick["path"] = path
 	var b: Button = pick["button"]
+	var pat = pick.get("kind", "") == "pattern"
 	if path == "" or path == PATH_SAME_HIP:
 		b.text = "Same as Ridge" if hip else ("Same as Hip" if path == PATH_SAME_HIP else "Choose...")
 		b.icon = null
 	else:
 		b.text = _path_name(path)
-		var t = _paths_seen.get(path)
+		var t = (_patterns_seen if pat else _paths_seen).get(path)
 		if t == null:
-			t = _path_tex(path)
+			t = _flat_tex(path) if pat else _path_tex(path)
 		b.icon = _path_thumb(t)
 	b.hint_tooltip = path if path != "" else b.text
 
@@ -6117,8 +6766,28 @@ func _open_path_pop(section: String, field: String) -> void:
 		_path_pop.connect("popup_hide", self, "_on_text_focus", [false])
 		# Under the Roof Builder section: DD's theme.
 		c["root"].add_child(_path_pop)
+	# Paths: one per line, wide; patterns: a grid.
+	var kind = "pattern" if c[field].get("kind", "") == "pattern" else "path"
+	if not _path_pop_target.empty():
+		_pop_search_mem[_path_pop_kind] = _path_pop_search.text
+	_path_pop_kind = kind
 	_path_pop_target = [section, field]
-	# (the search is kept from one opening to the next)
+	if kind == "pattern":
+		_path_pop.window_title = "Choose a Pattern"
+		_path_pop_list.max_columns = 0
+		_path_pop_list.icon_mode = ItemList.ICON_MODE_TOP
+		_path_pop_list.fixed_icon_size = Vector2(80, 80)
+		_path_pop_list.fixed_column_width = 96
+		_path_pop_list.same_column_width = true
+	else:
+		_path_pop.window_title = "Choose a Path"
+		_path_pop_list.max_columns = 1
+		_path_pop_list.icon_mode = ItemList.ICON_MODE_LEFT
+		_path_pop_list.fixed_icon_size = Vector2(256, 40)
+		_path_pop_list.fixed_column_width = 0
+		_path_pop_list.same_column_width = false
+	# (the search is kept from one opening to the next, one per kind)
+	_path_pop_search.text = _pop_search_mem.get(kind, "")
 	_fill_path_pop(_path_pop_search.text)
 	_path_pop.popup_centered(Vector2(460, 560))
 	_path_pop_search.grab_focus()
@@ -6133,6 +6802,22 @@ func _fill_path_pop(text: String) -> void:
 	# Always on top: Same as Ridge (Hip Path), Same as Hip (Ridge Path, once
 	# the Hip Path is set, on roofs with hips).
 	var c = _ui.get(_path_pop_target[0]) if not _path_pop_target.empty() else null
+	if _path_pop_kind == "pattern":
+		_path_pop_same.visible = false
+		for path in _pattern_items():
+			var key = path.to_lower()
+			var ok = true
+			for t in terms:
+				if key.find(t) < 0:
+					ok = false
+					break
+			if not ok:
+				continue
+			_path_pop_list.add_item(_path_name(path), _patterns_seen.get(path))
+			var i = _path_pop_list.get_item_count() - 1
+			_path_pop_list.set_item_metadata(i, path)
+			_path_pop_list.set_item_tooltip(i, path)
+		return
 	if hip:
 		_path_pop_same.text = "Same as Ridge"
 		_path_pop_same.visible = true
@@ -6172,6 +6857,7 @@ func _path_pop_apply(path: String) -> void:
 		return
 	_set_path_pick(c[field], path, field == "cap_path_hip")
 	_apply_fields(section, {field: path})
+	_update_visibility(section)
 
 
 func _on_text_focus(on: bool) -> void:
@@ -6222,6 +6908,10 @@ func _on_mode_pressed(mode: int, section: String) -> void:
 
 
 func _on_toggle_changed(pressed: bool, section: String, field: String) -> void:
+	# A switch turned on opens its settings (cog).
+	var cc = _ui.get(section)
+	if pressed and not _updating_ui and cc != null and cc.has(field + "_cog"):
+		cc[field + "_cog"].set_pressed_no_signal(true)
 	_update_visibility(section)
 	if _updating_ui:
 		return
@@ -6280,6 +6970,19 @@ func _on_value_changed(value: float, section: String, field: String, source: Str
 func _linked(section: String, field: String, v: float) -> Dictionary:
 	var out = {field: v}
 	var c = _ui.get(section)
+	if field == "rc_bright" or field == "rc_hue" or field == "rc_sat":
+		# Recolor sliders: the parts picked in the menu (each keeps its own
+		# values; All Roof its own, added to theirs; Hip & Ridge sets both).
+		out = {}
+		var ch = field.substr(3)
+		var on = c["recolor_on"]["option"].selected if c != null and c.has("recolor_on") else RC_ALL
+		for part in RC_PARTS[on]:
+			out[part + "_" + ch] = v
+			if c != null and c.has("rc_vals"):
+				c["rc_vals"][part + "_" + ch] = v
+		if c != null and c.has("rc_vals"):
+			_rc_marks(c)
+		return out
 	if field == "cap_wsl":
 		# Width slider: Hip, Ridge or Both (ratio kept); Gap Free: ridge.
 		out = {}
@@ -6322,10 +7025,72 @@ func _link_take(section: String) -> void:
 	_link_k = float(c["scale"]["spin"].value) / max(cos(deg2rad(float(c["pitch"]["spin"].value))), 0.05)
 
 
+# Recolor sliders: show the values of the part picked in the menu (All
+# Roof: the tiles', Hip & Ridge: the ridges').
+func _rc_show(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null or not c.has("rc_bright"):
+		return
+	_rc_marks(c)
+	var on = c["recolor_on"]["option"].selected
+	var part = ["all", "tile", "ridge", "hip", "ridge", "flat"][clamp(on, 0, 5)]
+	var was = _updating_ui
+	_updating_ui = true
+	for ch in ["bright", "hue", "sat"]:
+		_set_ctl(c["rc_" + ch], float(c["rc_vals"].get(part + "_" + ch, 0.0)))
+	_updating_ui = was
+
+
+# Reset beside the Recolor cog: every part back to its default (0, Flat
+# Part: a little brighter and greyer).
+func _on_rc_reset(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null or not c.has("rc_vals"):
+		return
+	var fields = {}
+	for k in RC_KEYS:
+		c["rc_vals"][k] = float(DEFAULT_CFG[k])
+		fields[k] = float(DEFAULT_CFG[k])
+	_rc_show(section)
+	_apply_fields(section, fields)
+
+
+# Reset beside the Texture Settings cog: all of them back to default.
+func _on_tex_reset(section: String) -> void:
+	var c = _ui.get(section)
+	if c == null:
+		return
+	var fields = {}
+	_updating_ui = true
+	for k in ["scale", "ridge_offset", "repeat", "edge", "u_offset", "pitch"]:
+		if c.has(k):
+			fields[k] = float(DEFAULT_CFG[k])
+			_set_ctl(c[k], fields[k])
+	_updating_ui = false
+	_link_take(section)
+	_apply_fields(section, fields)
+
+
+# Recolor Part menu: a star on the parts changed from their defaults (Hip &
+# Ridge: when one of its parts is).
+func _rc_marks(c: Dictionary) -> void:
+	var names = ["All Roof", "Tiles", "Hip & Ridge", "Hip", "Ridge", "Flat Part"]
+	var rco: OptionButton = c["recolor_on"]["option"]
+	for i in range(names.size()):
+		var changed = false
+		for part in RC_PARTS[i]:
+			for ch in ["bright", "hue", "sat"]:
+				var k = part + "_" + ch
+				if abs(float(c["rc_vals"].get(k, DEFAULT_CFG[k])) - float(DEFAULT_CFG[k])) > 0.001:
+					changed = true
+		rco.set_item_text(i, names[i] + (" *" if changed else ""))
+
+
 # Which caps the Width slider sizes (Gap Free: the ridge).
 func _wsl_on(section: String) -> int:
 	var c = _ui.get(section)
-	if c == null or not c.has("cap_width_on") or _ui_mode(section) == MODE_FILL:
+	# (only Hip roofs with Ridge Caps have hips)
+	if c == null or not c.has("cap_width_on") or _ui_mode(section) != MODE_HIP or c["seams"]["option"].selected != SEAMS_CAPS:
 		return 1
 	return c["cap_width_on"]["option"].selected
 
@@ -6358,7 +7123,18 @@ func _on_reset_pressed(section: String, field: String) -> void:
 	var c = _ui.get(section)
 	if c == null or not c.has(field):
 		return
-	var v = float(DEFAULT_CFG.get(field, 100.0))
+	if field.begins_with("rc_") and c.has("rc_vals"):
+		# Recolor: the parts of the menu's choice back to 0.
+		var ch = field.replace("rc_", "")
+		var fields = {}
+		for part in RC_PARTS[c["recolor_on"]["option"].selected]:
+			var k = part + "_" + ch
+			c["rc_vals"][k] = 0.0
+			fields[k] = 0.0
+		_rc_show(section)
+		_apply_fields(section, fields)
+		return
+	var v = float(RESET_VALUES.get(field, DEFAULT_CFG.get(field, VIRTUAL_DEFAULTS.get(field, 100.0))))
 	_updating_ui = true
 	_set_ctl(c[field], v * 100.0 if field == "shade" else v)
 	_updating_ui = false
@@ -7198,6 +7974,10 @@ func _lib_input(event) -> void:
 	for grid in _lib_grids.keys():
 		if not is_instance_valid(grid) or not grid.is_visible_in_tree():
 			continue
+		# A menu or a window open (drop-down list, picker...), even over the
+		# list: the click is theirs.
+		if grid.get_viewport() != null and grid.get_viewport().gui_has_modal_stack():
+			return
 		var lp = grid.get_local_mouse_position()
 		if not Rect2(Vector2.ZERO, grid.rect_size).has_point(lp):
 			continue
