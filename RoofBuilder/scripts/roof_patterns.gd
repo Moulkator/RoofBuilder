@@ -158,7 +158,7 @@ const DEFAULT_CFG = {
 	"cap_tip": 35.0,
 	"ridge_ends": 0,
 	"cap_fade": 15.0,
-	"seams": SEAMS_SOFT,
+	"seams": SEAMS_CAPS,
 	"repeat": 0.0,
 	"round_ends": 0,
 }
@@ -207,6 +207,11 @@ const CT_PARAMS = {
 }
 
 const SHADER_CODE = """shader_type canvas_item;
+// Unofficial Patch's hover overlay, built in (off by default): the overlay can
+// reuse this shader as is instead of compiling a copy with it injected.
+// (Own names: an older patch still injects its _ov_* uniforms.)
+uniform vec3 ovl_tint = vec3(0.11, 0.016, 0.24);
+uniform float ovl_opacity = 0.0;
 render_mode blend_mix;
 
 uniform sampler2D albedo;
@@ -270,18 +275,17 @@ uniform float flat_frac = 0.4;
 uniform float flat_hmax = 100.0;
 // Texture of the flat part: 0 the roof's own (its repeated rows), 1 flat_tex.
 uniform int flat_src = 0;
-uniform sampler2D flat_tex;
 uniform float flat_rot = 0.0;
 uniform float flat_scale = 1.0;
 // A ridge (cap, with the Ridge Caps settings) all around the flat part.
 uniform bool flat_edge = false;
-// Centered roofs: curved slope (Profile). profile_lut, at x = share of the
-// way up as a cone (0 eave, 1 top): r = share of the way up along the curved
-// slope, g = how much it slopes (shading, 1 = cone), b = inverse of r.
+// Centered roofs: curved slope (Profile). Its lookup table is row 2 of lut
+// (see profile_at): at x = share of the way up as a cone (0 eave, 1 top),
+// r = share of the way up along the curved slope, g = how much it slopes
+// (shading, 1 = cone), b = inverse of r.
 uniform bool profile_on = false;
 // Slope length of the profile / radius: more rows where the slope is long.
 uniform float profile_len = 1.0;
-uniform sampler2D profile_lut : hint_black;
 // Seams set to None: no ink line / shadow on hard ridge and hip lines.
 uniform bool seam_lines = true;
 // Size of the ink lines and seam shadows (texels): the tile row height, or a
@@ -332,7 +336,9 @@ uniform bool skirt_mode = false;
 uniform bool bake_mode = false;
 uniform float skirt_w = 30.0;
 uniform int bake_n = 64;
-uniform sampler2D bake_tex : hint_black;
+// skirt_mode: the baked coverage; otherwise the Flat Roof pattern. (One
+// sampler for both: Godot keeps few texture units for a shader on macOS.)
+uniform sampler2D aux_tex : hint_black;
 uniform vec2 bake_pos = vec2(0.0);
 uniform vec2 bake_size = vec2(1.0);
 uniform bool star_shape = true;
@@ -432,6 +438,17 @@ vec4 roof_sample(float ux, float t, float lod, vec2 size)
 	return c;
 }
 
+// Profile lookup: row 2 of lut, PROFILE_N texels, linear.
+const float PROFILE_N = 256.0;
+
+vec4 profile_at(float x)
+{
+	float fx = clamp(x * PROFILE_N - 0.5, 0.0, PROFILE_N - 1.0);
+	int i0 = int(floor(fx));
+	int i1 = min(i0 + 1, int(PROFILE_N) - 1);
+	return mix(texelFetch(lut, ivec2(i0, 2), 0), texelFetch(lut, ivec2(i1, 2), 0), fx - float(i0));
+}
+
 // Taper: tiles in course kf (courses are the rings at a constant fraction
 // of the way to the top, one texture row high; the eave's partial course is
 // merged into the first one so the eave tiles are never cut).
@@ -441,7 +458,7 @@ float course_tiles(float kf, float t0, float d_ref, float tiles_eave)
 	float u_k = clamp(t_mid / (pitch_scale * d_ref * (profile_on ? profile_len : 1.0)), 0.0, 1.0);
 	if (profile_on)
 	{
-		u_k = texture(profile_lut, vec2(u_k, 0.5)).b;
+		u_k = profile_at(u_k).b;
 	}
 	float s_k = 1.0 - u_k;
 	float n = tiles_eave * s_k;
@@ -803,7 +820,7 @@ float valley_fade(float x)
 
 vec4 skirt_shadow(vec2 v)
 {
-	float c = textureLod(bake_tex, (v - bake_pos) / bake_size, 0.0).r;
+	float c = textureLod(aux_tex, (v - bake_pos) / bake_size, 0.0).r;
 	if (c <= 0.004)
 	{
 		return vec4(0.0);
@@ -1825,7 +1842,7 @@ void fragment()
 			if (t > e0)
 			{
 				float uc = clamp((t - e0) / (full - e0), 0.0, 1.0);
-				vec4 pf = texture(profile_lut, vec2(uc, 0.5));
+				vec4 pf = profile_at(uc);
 				t = e0 + (full * profile_len - e0) * pf.r;
 				face_n *= pf.g;
 			}
@@ -1833,7 +1850,7 @@ void fragment()
 			{
 				// Eave band: same slope as the rim, so the shading reaches
 				// the tile tips.
-				face_n *= texture(profile_lut, vec2(0.0, 0.5)).g;
+				face_n *= profile_at(0.0).g;
 			}
 		}
 		// columns = texture repeats around the eave (outline / texture width).
@@ -2476,6 +2493,43 @@ void fragment()
 			texel *= mix(1.0, 0.12, (1.0 - smoothstep(c_ink * 0.5, c_ink, de_min)) * max(cap_a - tip_k, 0.0));
 		}
 	}
+	// Edge of the flat part (Centered): the outline shrunk toward the top,
+	// its true distance (the share along the rays from a moved top is not:
+	// the flat part's ridge would wave and change width).
+	vec2 flat_en = vec2(0.0);
+	if (flat_on && roof_mode == 2 && edge_count > 0)
+	{
+		float fbest = 100000000.0;
+		vec2 fdv = vec2(0.0);
+		// Length along the shrunk outline, for the ridge's texture (the share
+		// along the rays stretches it like the tiles when the top is moved).
+		float facc = 0.0;
+		float fpos = 0.0;
+		for (int i = 0; i < edge_count; i++)
+		{
+			vec4 e = texelFetch(edges, ivec2(i, 0), 0);
+			vec2 fa0 = center + (e.xy - center) * flat_frac;
+			vec2 fab = (e.zw - e.xy) * flat_frac;
+			float fl2 = max(dot(fab, fab), 0.000001);
+			float fh = clamp(dot(v_local - fa0, fab) / fl2, 0.0, 1.0);
+			vec2 dv = v_local - fa0 - fab * fh;
+			float dd = dot(dv, dv);
+			float fln = sqrt(fl2);
+			if (dd < fbest)
+			{
+				fbest = dd;
+				fdv = dv;
+				fpos = facc + fh * fln;
+			}
+			facc += fln;
+		}
+		flat_a = fpos;
+		float fsg = flat_d >= 0.0 ? 1.0 : -1.0;
+		fbest = sqrt(fbest);
+		flat_d = fsg * fbest;
+		// (towards the flat part)
+		flat_en = fbest > 0.0001 ? fsg * fdv / fbest : vec2(0.0);
+	}
 	if (flat_on)
 	{
 		float fpx = max(max(length(dx), length(dy)), 0.000001);
@@ -2489,8 +2543,8 @@ void fragment()
 			vec4 fc;
 			if (flat_src == 1)
 			{
-				vec2 fts = vec2(textureSize(flat_tex, 0)) * flat_scale;
-				fc = texture(flat_tex, fp / max(fts, vec2(1.0)));
+				vec2 fts = vec2(textureSize(aux_tex, 0)) * flat_scale;
+				fc = texture(aux_tex, fp / max(fts, vec2(1.0)));
 				fc.a *= COLOR.a;
 			}
 			else
@@ -2533,7 +2587,7 @@ void fragment()
 			if (fad < ehw * 2.5)
 			{
 				float esh = 0.0;
-				vec2 en = length(face_n) > 0.0001 ? -normalize(face_n) : vec2(0.0, -1.0);
+				vec2 en = length(flat_en) > 0.5 ? flat_en : (length(face_n) > 0.0001 ? -normalize(face_n) : vec2(0.0, -1.0));
 				vec4 ec = cap_piece(flat_a, flat_d / ehw, -1.0, en, vec2(0.0), ehw, COLOR, size, fpx, esh, true);
 				texel *= 1.0 - (cap_style == 3 ? 0.5 : 0.35) * esh * esh * smoothstep(0.6, 0.95, alpha);
 				if (ec.a > 0.0)
@@ -2639,13 +2693,19 @@ void fragment()
 	}
 	COLOR = vec4(texel, alpha * keep);
 	}
+	if (ovl_opacity > 0.0)
+	{
+		float ovl_l = dot(COLOR.rgb, vec3(0.299, 0.587, 0.114));
+		float ovl_g = ovl_l - smoothstep(0.6, 1.0, ovl_l) * 0.5;
+		COLOR.rgb = mix(COLOR.rgb, clamp(vec3(ovl_g) + ovl_tint, 0.0, 1.0), ovl_opacity);
+	}
 }
 """
 
 var _shader: Shader = null
 var _tex_info := {}       # texture instance id -> analysis Dictionary
 var _states := {}         # "node-id-N" -> {"mat", "sig", "lut"}
-const TOOL_DEFAULTS = {"enabled": false, "mode": MODE_FILL, "mirror": false, "round_ends": 0, "merge": false, "seams": SEAMS_SOFT, "profile": PROFILE_CONE}
+const TOOL_DEFAULTS = {"enabled": false, "mode": MODE_FILL, "mirror": false, "round_ends": 0, "merge": false, "seams": SEAMS_CAPS, "profile": PROFILE_CONE, "flat_on": false}
 var _tool_cfg := TOOL_DEFAULTS.duplicate()   # Pattern Tool: next shapes (reset with every map)
 var _world_ref = null
 var _pruned := false
@@ -2837,12 +2897,7 @@ func _detect_new_shapes(store: Dictionary) -> void:
 			var nd = _g.World.GetNodeByID(nid)
 			if _is_pattern_shape(nd) and not _never_roof(nd, nid):
 				var cfg = _full_cfg({})
-				cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
-				cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
-				cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
-				cfg["merge"] = bool(_tool_cfg.get("merge", false))
-				cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
-				cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
+				_with_tool_cfg(cfg)
 				store["node-id-" + str(nid)] = cfg
 	elif active != "PatternShapeTool":
 		# Paste / duplicate (Select Tool), prefabs...: new pattern shapes are
@@ -3321,7 +3376,7 @@ func _update_skirt(node, mat: ShaderMaterial, cfg: Dictionary, st: Dictionary = 
 	var sm = mat.duplicate()
 	sm.set_shader_param("skirt_mode", true)
 	sm.set_shader_param("skirt_w", w)
-	sm.set_shader_param("bake_tex", btex)
+	sm.set_shader_param("aux_tex", btex)
 	sm.set_shader_param("bake_pos", rect.position)
 	sm.set_shader_param("bake_size", rect.size)
 	sk.material = sm
@@ -3892,7 +3947,7 @@ func update_material(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionar
 	mat.set_shader_param("body_end", info.get("body_end", info["h"]))
 	mat.set_shader_param("eave_band", max(info["h"] - info["empty"] - float(cfg.get("edge", 0.0)) - info.get("body_end", info["h"]), 0.0))
 	# Softer Seams: width (texels) of the blend across ridges / hip lines.
-	var seams = int(cfg.get("seams", SEAMS_SOFT))
+	var seams = int(cfg.get("seams", SEAMS_CAPS))
 	var caps_ok = mode == MODE_HIP or (mode == MODE_FILL and bool(cfg.get("mirror", false)))
 	# Flat Roof with Ridge Caps: a ridge all around the flat part.
 	var flat_ok = bool(cfg.get("flat_on", false)) and not (mode == MODE_FILL and not bool(cfg.get("mirror", false)))
@@ -4015,7 +4070,7 @@ func _set_flat(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary, inf
 		# (pattern not chosen, or its pack is missing: the roof texture)
 		src = 0
 	else:
-		mat.set_shader_param("flat_tex", ft)
+		mat.set_shader_param("aux_tex", ft)
 	mat.set_shader_param("flat_src", src)
 	mat.set_shader_param("flat_rot", deg2rad(float(cfg.get("flat_rot", 0.0))))
 	mat.set_shader_param("flat_scale", clamp(float(cfg.get("flat_scale", 100.0)), 5.0, 1000.0) / 100.0)
@@ -4144,10 +4199,18 @@ func _profile_len(kind: int, curve: float) -> float:
 	return float(_profile_lens.get("%d_%d" % [kind, int(round(clamp(curve, 0.0, 100.0)))], 1.0))
 
 
-# Centered roofs, Profile: lookup table (see profile_lut in the shader).
+# Centered roofs, Profile: lookup table (row 2 of the round LUT, see profile_at in the shader).
 # Height z of the slope at radius share rho (0 top, 1 eave), top at z = h.
 # curve (0..100, 50 = default): how steep the slope gets at the eave; higher
 # = rows packed tighter there.
+# The profile's lookup table as an image (row 2 of the round LUT).
+var _profile_imgs = {}
+
+func _profile_img(kind: int, curve: float = 50.0) -> Image:
+	_profile_tex(kind, curve)
+	return _profile_imgs["%d_%d" % [kind, int(round(clamp(curve, 0.0, 100.0)))]]
+
+
 func _profile_tex(kind: int, curve: float = 50.0) -> ImageTexture:
 	curve = clamp(curve, 0.0, 100.0)
 	var key = "%d_%d" % [kind, int(round(curve))]
@@ -4221,6 +4284,7 @@ func _profile_tex(kind: int, curve: float = 50.0) -> ImageTexture:
 	var tex = ImageTexture.new()
 	tex.create_from_image(img, Texture.FLAG_FILTER)
 	_profile_cache[key] = tex
+	_profile_imgs[key] = img
 	_profile_lens[key] = total / max(length, 0.000001)
 	return tex
 
@@ -4459,7 +4523,18 @@ func _update_round(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary,
 	if lut == null:
 		lut = ImageTexture.new()
 		st["lut"] = lut
-	lut.create_from_image(data["image"], 0)
+	var prof = int(cfg.get("profile", PROFILE_CONE))
+	if prof != PROFILE_CONE:
+		# Profile: its lookup table as a third row.
+		var src: Image = data["image"]
+		var img3 = Image.new()
+		img3.create(src.get_width(), 3, false, Image.FORMAT_RGBAF)
+		img3.blit_rect(src, Rect2(0, 0, src.get_width(), 2), Vector2(0, 0))
+		var pimg: Image = _profile_img(prof, float(cfg.get("curve", 50.0)))
+		img3.blit_rect(pimg, Rect2(0, 0, min(pimg.get_width(), src.get_width()), 1), Vector2(0, 2))
+		lut.create_from_image(img3, 0)
+	else:
+		lut.create_from_image(data["image"], 0)
 	var taper = bool(cfg.get("taper", true))
 	var perimeter = data["perimeter"]
 	var base = max(1.0, perimeter / max(info["w"] * _tex_scale(cfg), 1.0))
@@ -4475,10 +4550,8 @@ func _update_round(mat: ShaderMaterial, poly: PoolVector2Array, cfg: Dictionary,
 	mat.set_shader_param("row_y0", info.get("row_y0", 0.0))
 	mat.set_shader_param("tile_n", info.get("tile_n", 0.0))
 	mat.set_shader_param("taper", taper)
-	var prof = int(cfg.get("profile", PROFILE_CONE))
 	mat.set_shader_param("profile_on", prof != PROFILE_CONE)
 	if prof != PROFILE_CONE:
-		mat.set_shader_param("profile_lut", _profile_tex(prof, float(cfg.get("curve", 50.0))))
 		mat.set_shader_param("profile_len", _profile_len(prof, float(cfg.get("curve", 50.0))))
 	mat.set_shader_param("smooth_shape", data["smooth"])
 	mat.set_shader_param("star_shape", data["star"])
@@ -5359,12 +5432,7 @@ func _build_ui() -> void:
 			anchor = _find_layer_anchor(tp.Align, 0)
 		_ui["tool"] = _make_section(tp.Align, anchor, UI_TOOL_NAME, "tool", false, icon_roof, icon_reset)
 		var cfg = _full_cfg({})
-		cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
-		cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
-		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
-		cfg["merge"] = bool(_tool_cfg.get("merge", false))
-		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
-		cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
+		_with_tool_cfg(cfg)
 		_set_ui_values("tool", cfg, bool(_tool_cfg.get("enabled", false)))
 	var sp = toolset.GetToolPanel("SelectTool")
 	if sp != null and sp.get("Align") != null:
@@ -5593,6 +5661,9 @@ func _make_section(align: Node, anchor, node_name: String, section: String, full
 	# Profile above Seams.
 	opts.move_child(c["profile"]["row"], c["seams"]["row"].get_index())
 	if not full:
+		c["flat_on"] = _make_toggle(opts, "Flat Roof",
+			"The next roofs drawn have a flat top (settings: Select Tool).",
+			section, "flat_on")
 		c["merge"] = _make_toggle(opts, "Merge With Roof Below",
 			"The next roofs drawn join the roofs below them: where a roof\nbelow rises higher, it shows through, so the roofs meet on\ntheir real intersection line.",
 			section, "merge")
@@ -5838,7 +5909,7 @@ func _group_ui(c: Dictionary) -> void:
 			[c["shade_on_row"], c["global_light"], c["shade"]["row"], c["light"]["row"]],
 			[c["tex_cog"].get_parent(), c["tex_box"]], [c["recolor_row"], c["rc_box"]]]
 	else:
-		groups = [shape, seams, [c["merge"]]]
+		groups = [shape, seams, [c["flat_on"]], [c["merge"]]]
 	var holder = Control.new()
 	holder.visible = false
 	opts.add_child(holder)
@@ -6358,6 +6429,7 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 	c["mirror"].pressed = full["mirror"]
 	c["round_ends"]["option"].select(full["round_ends"])
 	c["merge"].pressed = full["merge"]
+	c["flat_on"].pressed = full["flat_on"]
 	c["seams"]["option"].select(full["seams"])
 	c["profile"]["option"].select(full["profile"])
 	if c["full"]:
@@ -6392,7 +6464,6 @@ func _set_ui_values(section: String, cfg, enabled: bool) -> void:
 		c["cap_corners"]["option"].select(full["cap_corners"])
 		_set_ctl(c["cap_tip"], full["cap_tip"])
 		c["ridge_ends"]["option"].select(full["ridge_ends"])
-		c["flat_on"].pressed = full["flat_on"]
 		_set_ctl(c["flat_size"], full["flat_size"])
 		c["flat_src"]["option"].select(full["flat_src"])
 		_set_path_pick(c["flat_pattern"], full["flat_pattern"], false)
@@ -6522,6 +6593,7 @@ func _update_visibility(section: String) -> void:
 	var caps_real = caps_ok and c["seams"]["option"].selected == SEAMS_CAPS
 	var caps_on = (caps_ok or flat) and c["seams"]["option"].selected == SEAMS_CAPS
 	if not c["full"]:
+		c["flat_on"].visible = flat_ok
 		_update_groups(c)
 		return
 	var shaded = mode != MODE_FILL or c["mirror"].pressed
@@ -7305,22 +7377,24 @@ func _update_selection(store: Dictionary) -> void:
 		_set_ui_values("select", store[key], true)
 	else:
 		var cfg = _full_cfg({})
-		cfg["mode"] = int(_tool_cfg.get("mode", MODE_FILL))
-		cfg["mirror"] = bool(_tool_cfg.get("mirror", false))
-		cfg["round_ends"] = int(_tool_cfg.get("round_ends", 0))
-		cfg["merge"] = bool(_tool_cfg.get("merge", false))
-		cfg["seams"] = int(_tool_cfg.get("seams", SEAMS_SOFT))
-		cfg["profile"] = int(_tool_cfg.get("profile", PROFILE_CONE))
+		_with_tool_cfg(cfg)
 		_set_ui_values("select", cfg, false)
 
 
 # ── Tool settings persistence ─────────────────────────────────────────────────
 
+# The Pattern Tool settings (next shapes) into cfg.
+func _with_tool_cfg(cfg: Dictionary) -> void:
+	for k in TOOL_DEFAULTS:
+		if k != "enabled":
+			cfg[k] = _tool_cfg.get(k, TOOL_DEFAULTS[k])
+
+
 # Pattern Tool settings back to their defaults (every map opened).
 func _reset_tool_cfg() -> void:
 	_tool_cfg = TOOL_DEFAULTS.duplicate()
 	var cfg = _full_cfg({})
-	cfg["mode"] = int(_tool_cfg["mode"])
+	_with_tool_cfg(cfg)
 	_set_ui_values("tool", cfg, false)
 
 

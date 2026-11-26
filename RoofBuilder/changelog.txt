@@ -1,5 +1,18 @@
 ROOF BUILDER
 
+1.3.1
+NEW:
+- Added the Flat Roof switch to the Pattern Tool (its settings stay in the Select Tool)
+- Unofficial Patch's hover overlay is built into the roof shader: no more hitch when hovering a roof (needs the matching Unofficial Patch update, 1.7.5 or later)
+
+CHANGED:
+- Seams now default to Ridge Caps (was Soft)
+
+FIXED:
+- Fixed the map turning white on macOS with Roof Builder on (the roof shader used too many textures for macOS)
+- Fixed the flat part's ridge on Centered roofs with a Custom Top Position (it waved, changed width and its texture was stretched)
+
+
 1.3.0
 NEW:
 - Added Flat Roof (Hip, Centered, Gap Free with Two Slopes): flat top with Flat Texture (roof texture or a pattern picked in a window with a search bar), Flat Size, Flat Rotation and Flat Scale. With Seams on Ridge Caps, a ridge runs all around it
